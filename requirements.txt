@@ -1,0 +1,15 @@
+fastapi==0.115.0
+uvicorn==0.30.6
+langchain==0.2.14
+langchain-openai==0.1.23
+langchain-community==0.2.12
+openai==1.43.0
+faiss-cpu==1.8.0.post1
+pymilvus==2.4.4
+unstructured==0.15.9
+pdfplumber==0.11.4
+tiktoken==0.7.0
+python-dotenv==1.0.1
+starlette-exporter==0.21.0
+prometheus-client==0.20.0
+pytest==8.3.2

@@ -1,0 +1,23 @@
+version: "3.9"
+services:
+  milvus-standalone:
+    image: milvusdb/milvus-standalone:v2.4.8
+    container_name: milvus
+    ports: ["19530:19530", "9091:9091"]
+    environment:
+      ETCD_USE_EMBED: "true"
+      MINIO_USE_EMBED: "true"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    env_file: .env
+    ports: ["8000:8000"]
+    depends_on:
+      - milvus-standalone

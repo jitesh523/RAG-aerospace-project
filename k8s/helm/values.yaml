@@ -1,0 +1,20 @@
+image:
+  repository: ghcr.io/YOUR_USER/rag-aerospace
+  tag: latest
+  pullPolicy: IfNotPresent
+
+env:
+  - name: OPENAI_API_KEY
+    valueFrom:
+      secretKeyRef: { name: openai-secret, key: api_key }
+  - name: EMBED_MODEL
+    value: text-embedding-3-large
+  - name: MILVUS_HOST
+    value: milvus-standalone.milvus.svc.cluster.local
+  - name: MILVUS_PORT
+    value: "19530"
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8000
