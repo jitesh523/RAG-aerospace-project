@@ -15,11 +15,10 @@ class FakeChain:
 
 
 def test_ask_endpoint_with_mock_chain():
-    # Bypass readiness and real LLM/retriever
+    # Create client (triggers startup), then override chain/readiness
+    client = TestClient(appmod.app)
     appmod.qa_chain = FakeChain()
     appmod.READY = True
-
-    client = TestClient(appmod.app)
     r = client.post("/ask", json={"query": "what is wing loading?"})
     assert r.status_code == 200
     body = r.json()
