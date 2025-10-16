@@ -13,6 +13,12 @@ env:
     value: milvus-standalone.milvus.svc.cluster.local
   - name: MILVUS_PORT
     value: "19530"
+  - name: RETRIEVER_BACKEND
+    value: faiss
+  - name: METRICS_PUBLIC
+    value: "false"
+  - name: RATE_LIMIT_PER_MIN
+    value: "120"
 
 service:
   type: ClusterIP

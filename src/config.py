@@ -19,3 +19,7 @@ class Config:
     # Retrieval params
     RETRIEVER_K = int(os.getenv("RETRIEVER_K", "5"))
     RETRIEVER_FETCH_K = int(os.getenv("RETRIEVER_FETCH_K", "25"))
+    # Auth & rate limiting
+    API_KEY = os.getenv("API_KEY")  # if set, required for /ask
+    METRICS_PUBLIC = os.getenv("METRICS_PUBLIC", "true").lower() == "true"
+    RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "60"))

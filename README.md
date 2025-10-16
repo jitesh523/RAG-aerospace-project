@@ -149,7 +149,11 @@ helm install milvus milvus/milvus -n milvus --create-namespace
 helm install rag-aerospace ./k8s/helm -n rag-aerospace
 ```
 
-### 3. Access the Application
+### 3. Probes, Access the Application
+
+The Helm chart configures:
+- Liveness probe -> `/health`
+- Readiness probe -> `/ready`
 
 ```bash
 # Port forward for testing
@@ -166,9 +170,11 @@ The application exposes Prometheus metrics at `/metrics`:
 - Vector search performance
 - Error rates and types
 
+You can restrict public access to `/metrics` by setting `METRICS_PUBLIC=false` and providing an `API_KEY`. In that mode, `/metrics` requires the header `x-api-key: <API_KEY>`.
+
 ### Health Checks
-- Readiness probe: `/metrics` (ensures FAISS index is loaded)
-- Liveness probe: Built-in FastAPI health check
+- Readiness probe: `/ready` (verifies FAISS presence or Milvus connectivity and collection load)
+- Liveness probe: `/health`
 
 ### Grafana Dashboard
 Create dashboards for:
@@ -181,7 +187,8 @@ Create dashboards for:
 
 ### Current Implementation
 - Environment-based secrets management
-- No authentication (suitable for internal/private networks)
+- Optional API key for `/ask` (set `API_KEY`) and optional metrics protection (`METRICS_PUBLIC=false`)
+- Simple in-memory rate limiting via `RATE_LIMIT_PER_MIN`
 
 ### Production Recommendations
 - **API Gateway**: Use Azure API Management with OAuth2/Azure AD
@@ -250,6 +257,14 @@ autoscaling:
 
 ### Environment Variables
 See `.env.example` for all configuration options.
+
+Key runtime settings:
+- `RETRIEVER_BACKEND`: `faiss` (default) or `milvus`.
+- `CHUNK_SIZE`, `CHUNK_OVERLAP`: controls PDF chunking in ingestion.
+- `RETRIEVER_K`, `RETRIEVER_FETCH_K`: retrieval parameters.
+- `API_KEY`: if set, `/ask` requires header `x-api-key`. Also used to protect `/metrics` when `METRICS_PUBLIC=false`.
+- `METRICS_PUBLIC`: `true` to expose `/metrics` openly; `false` to require `API_KEY`.
+- `RATE_LIMIT_PER_MIN`: requests per minute per API key/IP for `/ask`.
 
 ### Key Settings
 - `EMBED_MODEL`: Choose embedding model (OpenAI vs HuggingFace)

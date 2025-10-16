@@ -1,0 +1,30 @@
+{
+  "title": "RAG Aerospace API Overview",
+  "timezone": "browser",
+  "panels": [
+    {
+      "type": "graph",
+      "title": "HTTP Request Duration (ms)",
+      "targets": [
+        {"expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))"}
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "HTTP Requests per Second",
+      "targets": [
+        {"expr": "sum(rate(http_requests_total[1m]))"}
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Errors per Second",
+      "targets": [
+        {"expr": "sum(rate(http_requests_total{status=~\"5..\"}[1m]))"}
+      ]
+    }
+  ],
+  "templating": {"list": []},
+  "annotations": {"list": []},
+  "time": {"from": "now-6h", "to": "now"}
+}
