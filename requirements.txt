@@ -13,3 +13,5 @@ python-dotenv==1.0.1
 starlette-exporter==0.21.0
 prometheus-client==0.20.0
 pytest==8.3.2
+redis==5.0.8
+PyJWT==2.9.0

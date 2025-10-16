@@ -13,6 +13,21 @@ env:
     value: milvus-standalone.milvus.svc.cluster.local
   - name: MILVUS_PORT
     value: "19530"
+  - name: API_KEY
+    valueFrom:
+      secretKeyRef: { name: api-secrets, key: api_key }
+  - name: JWT_SECRET
+    valueFrom:
+      secretKeyRef: { name: api-secrets, key: jwt_secret }
+  - name: JWT_ISSUER
+    valueFrom:
+      secretKeyRef: { name: api-secrets, key: jwt_issuer }
+  - name: JWT_AUDIENCE
+    valueFrom:
+      secretKeyRef: { name: api-secrets, key: jwt_audience }
+  - name: REDIS_URL
+    valueFrom:
+      secretKeyRef: { name: api-secrets, key: redis_url }
   - name: RETRIEVER_BACKEND
     value: faiss
   - name: METRICS_PUBLIC

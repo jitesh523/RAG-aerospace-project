@@ -10,6 +10,8 @@ import time
 import uuid
 import logging
 import json
+import jwt
+import redis
 
 app = FastAPI(title="Aerospace RAG API", version="1.0.0")
 
@@ -20,8 +22,18 @@ if Config.METRICS_PUBLIC:
 else:
     @app.get("/metrics")
     def metrics(request: Request):
+        # Allow if API key matches or JWT is valid
         api_key = request.headers.get("x-api-key")
-        if not (Config.API_KEY and api_key == Config.API_KEY):
+        authz = request.headers.get("authorization", "")
+        jwt_ok = False
+        if authz.lower().startswith("bearer ") and Config.JWT_SECRET:
+            token = authz.split(" ", 1)[1]
+            try:
+                jwt.decode(token, Config.JWT_SECRET, algorithms=["HS256"], issuer=Config.JWT_ISSUER, audience=Config.JWT_AUDIENCE)
+                jwt_ok = True
+            except Exception:
+                jwt_ok = False
+        if not ((Config.API_KEY and api_key == Config.API_KEY) or jwt_ok):
             raise HTTPException(status_code=403, detail="Forbidden")
         return handle_metrics(request)
 
@@ -38,8 +50,16 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
     logger.addHandler(handler)
 
-# Simple in-memory rate limiter (per client IP or API key)
+# Rate limiter: Redis (if configured) with fallback to in-memory
 _rate_state = {}
+_redis = None
+if Config.REDIS_URL:
+    try:
+        _redis = redis.Redis.from_url(Config.REDIS_URL, decode_responses=True)
+        # ping to verify connectivity
+        _redis.ping()
+    except Exception:
+        _redis = None
 
 @app.middleware("http")
 async def add_request_id_and_logging(request: Request, call_next):
@@ -90,18 +110,45 @@ def ask(req: AskReq, request: Request):
     if Config.API_KEY:
         api_key = request.headers.get("x-api-key")
         if api_key != Config.API_KEY:
-            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+            # Allow JWT alternative if configured
+            authz = request.headers.get("authorization", "")
+            if authz.lower().startswith("bearer ") and Config.JWT_SECRET:
+                token = authz.split(" ", 1)[1]
+                try:
+                    jwt.decode(token, Config.JWT_SECRET, algorithms=["HS256"], issuer=Config.JWT_ISSUER, audience=Config.JWT_AUDIENCE)
+                except Exception:
+                    raise HTTPException(status_code=401, detail="Invalid or missing API key/JWT")
+            else:
+                raise HTTPException(status_code=401, detail="Invalid or missing API key/JWT")
     # Rate limiting
     key = request.headers.get("x-api-key") or (request.client.host if request.client else "unknown")
     now = int(time.time())
     window = now // 60
-    st = _rate_state.get(key)
-    if not st or st["window"] != window:
-        st = {"window": window, "count": 0}
-    st["count"] += 1
-    _rate_state[key] = st
-    if st["count"] > Config.RATE_LIMIT_PER_MIN:
-        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    if _redis is not None:
+        rl_key = f"rl:{key}:{window}"
+        try:
+            newv = _redis.incr(rl_key)
+            if newv == 1:
+                _redis.expire(rl_key, 65)
+            if newv > Config.RATE_LIMIT_PER_MIN:
+                raise HTTPException(status_code=429, detail="Rate limit exceeded")
+        except Exception:
+            # Fallback to in-memory if redis error
+            st = _rate_state.get(key)
+            if not st or st["window"] != window:
+                st = {"window": window, "count": 0}
+            st["count"] += 1
+            _rate_state[key] = st
+            if st["count"] > Config.RATE_LIMIT_PER_MIN:
+                raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    else:
+        st = _rate_state.get(key)
+        if not st or st["window"] != window:
+            st = {"window": window, "count": 0}
+        st["count"] += 1
+        _rate_state[key] = st
+        if st["count"] > Config.RATE_LIMIT_PER_MIN:
+            raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
     q = (req.query or "").strip()
     if not q:

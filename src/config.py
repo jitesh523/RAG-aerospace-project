@@ -23,3 +23,8 @@ class Config:
     API_KEY = os.getenv("API_KEY")  # if set, required for /ask
     METRICS_PUBLIC = os.getenv("METRICS_PUBLIC", "true").lower() == "true"
     RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "60"))
+    REDIS_URL = os.getenv("REDIS_URL")
+    # JWT (HMAC) support
+    JWT_SECRET = os.getenv("JWT_SECRET")
+    JWT_ISSUER = os.getenv("JWT_ISSUER")
+    JWT_AUDIENCE = os.getenv("JWT_AUDIENCE")
