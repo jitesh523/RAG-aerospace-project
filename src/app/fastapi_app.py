@@ -4,6 +4,8 @@ from starlette_exporter import PrometheusMiddleware, handle_metrics
 from src.app.deps import build_chain
 import os
 from fastapi import HTTPException
+from src.config import Config
+from src.index.milvus_index import check_milvus_readiness
 
 app = FastAPI(title="Aerospace RAG API", version="1.0.0")
 
@@ -24,7 +26,11 @@ def _startup():
         qa_chain = build_chain()
         # Basic readiness check: FAISS store presence + chain built
         faiss_path_exists = os.path.isdir("./faiss_store")
-        READY = qa_chain is not None and faiss_path_exists
+        if Config.RETRIEVER_BACKEND == "milvus":
+            milvus = check_milvus_readiness()
+            READY = qa_chain is not None and milvus.get("connected") and milvus.get("has_collection") and milvus.get("loaded")
+        else:
+            READY = qa_chain is not None and faiss_path_exists
     except Exception as e:
         # Do not crash on startup; mark as not ready
         READY = False
@@ -32,9 +38,14 @@ def _startup():
 
 @app.post("/ask")
 def ask(req: AskReq):
+    q = (req.query or "").strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="Query must not be empty")
+    if len(q) > 4000:
+        raise HTTPException(status_code=400, detail="Query too long (max 4000 chars)")
     if not READY or qa_chain is None:
         raise HTTPException(status_code=503, detail="Service not ready. Ingest documents to create ./faiss_store and restart.")
-    result = qa_chain.invoke(req.query)
+    result = qa_chain.invoke(q)
     sources = [
         {
             "source": d.metadata.get("source", ""),

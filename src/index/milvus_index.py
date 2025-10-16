@@ -32,3 +32,22 @@ def insert_rows(rows: List[Tuple[str, list, str, str, int]], name: str = Config.
     ids, embeds, texts, sources, pages = zip(*rows)
     col.insert([list(ids), list(embeds), list(texts), list(sources), list(pages)])
     col.flush()
+
+def check_milvus_readiness(name: str = Config.MILVUS_COLLECTION) -> dict:
+    """Return readiness info for Milvus connection and collection.
+    Example: {"connected": True, "has_collection": True, "loaded": True}
+    """
+    info = {"connected": False, "has_collection": False, "loaded": False}
+    try:
+        connect()
+        info["connected"] = True
+        info["has_collection"] = utility.has_collection(name)
+        if info["has_collection"]:
+            col = Collection(name)
+            # Try to load; if already loaded this is no-op
+            col.load()
+            info["loaded"] = True
+    except Exception:
+        # Keep defaults; caller can inspect
+        pass
+    return info

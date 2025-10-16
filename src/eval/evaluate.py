@@ -5,7 +5,7 @@ from src.config import Config
 
 def main(questions_path: str):
     embeddings = OpenAIEmbeddings(model=Config.EMBED_MODEL, api_key=Config.OPENAI_API_KEY)
-    vs = FAISS.load_local("./faiss_store", embeddings=embeddings, allow_dangerous_deserialization=True)
+    vs = FAISS.load_local("./faiss_store", embeddings=embeddings)
     retriever = vs.as_retriever(k=5)
     qs = json.load(open(questions_path))
     for q in qs:

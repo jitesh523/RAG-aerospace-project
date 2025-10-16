@@ -11,3 +11,11 @@ class Config:
     MILVUS_COLLECTION = os.getenv("MILVUS_COLLECTION", "aero_docs_v1")
     PORT = int(os.getenv("PORT", "8000"))
     ENV = os.getenv("ENV", "local")
+    # Retriever backend: "faiss" or "milvus"
+    RETRIEVER_BACKEND = os.getenv("RETRIEVER_BACKEND", "faiss").lower()
+    # Chunking params
+    CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
+    CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
+    # Retrieval params
+    RETRIEVER_K = int(os.getenv("RETRIEVER_K", "5"))
+    RETRIEVER_FETCH_K = int(os.getenv("RETRIEVER_FETCH_K", "25"))

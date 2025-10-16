@@ -16,7 +16,7 @@ def load_pdfs(input_dir: str):
     return docs
 
 def chunk_docs(docs):
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=Config.CHUNK_SIZE, chunk_overlap=Config.CHUNK_OVERLAP)
     return splitter.split_documents(docs)
 
 def to_milvus_rows(chunks, embeddings):
