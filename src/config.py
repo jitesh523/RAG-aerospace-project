@@ -28,3 +28,5 @@ class Config:
     JWT_SECRET = os.getenv("JWT_SECRET")
     JWT_ISSUER = os.getenv("JWT_ISSUER")
     JWT_AUDIENCE = os.getenv("JWT_AUDIENCE")
+    # Pushgateway for ingestion metrics (optional)
+    PUSHGATEWAY_URL = os.getenv("PUSHGATEWAY_URL")
