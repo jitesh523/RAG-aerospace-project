@@ -31,6 +31,13 @@ class TimedRetriever:
             VECTOR_SEARCH_DURATION.labels(self._backend_label).observe(elapsed)
 
 def build_chain():
+    if Config.MOCK_MODE:
+        class _FakeChain:
+            def invoke(self, q):
+                from types import SimpleNamespace
+                doc = SimpleNamespace(metadata={"source": "mock.pdf", "page": 1})
+                return {"result": f"mock answer: {q}", "source_documents": [doc]}
+        return _FakeChain()
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=Config.OPENAI_API_KEY)
     embeddings = OpenAIEmbeddings(model=Config.EMBED_MODEL, api_key=Config.OPENAI_API_KEY)
     backend = Config.RETRIEVER_BACKEND

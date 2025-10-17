@@ -3,6 +3,9 @@ image:
   tag: latest
   pullPolicy: IfNotPresent
 
+redis:
+  enabled: false
+
 env:
   - name: OPENAI_API_KEY
     valueFrom:

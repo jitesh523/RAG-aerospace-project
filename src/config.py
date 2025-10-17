@@ -34,3 +34,5 @@ class Config:
     JWT_JWKS_CACHE_SECONDS = int(os.getenv("JWT_JWKS_CACHE_SECONDS", "3600"))
     # Pushgateway for ingestion metrics (optional)
     PUSHGATEWAY_URL = os.getenv("PUSHGATEWAY_URL")
+    # Mock mode for e2e and CI (bypass LLM/retriever)
+    MOCK_MODE = os.getenv("MOCK_MODE", "false").lower() == "true"
