@@ -12,6 +12,9 @@ import logging
 import json
 import jwt
 import redis
+import requests
+
+from typing import Optional
 
 app = FastAPI(title="Aerospace RAG API", version="1.0.0")
 
@@ -26,13 +29,9 @@ else:
         api_key = request.headers.get("x-api-key")
         authz = request.headers.get("authorization", "")
         jwt_ok = False
-        if authz.lower().startswith("bearer ") and Config.JWT_SECRET:
+        if authz.lower().startswith("bearer "):
             token = authz.split(" ", 1)[1]
-            try:
-                jwt.decode(token, Config.JWT_SECRET, algorithms=["HS256"], issuer=Config.JWT_ISSUER, audience=Config.JWT_AUDIENCE)
-                jwt_ok = True
-            except Exception:
-                jwt_ok = False
+            jwt_ok = _verify_jwt(token)
         if not ((Config.API_KEY and api_key == Config.API_KEY) or jwt_ok):
             raise HTTPException(status_code=403, detail="Forbidden")
         return handle_metrics(request)
@@ -60,6 +59,66 @@ if Config.REDIS_URL:
         _redis.ping()
     except Exception:
         _redis = None
+
+# JWKS cache and verification helpers
+_jwks_cache = {"keys": None, "fetched_at": 0}
+
+def _fetch_jwks() -> Optional[dict]:
+    if not Config.JWT_JWKS_URL:
+        return None
+    now = int(time.time())
+    if _jwks_cache["keys"] and now - _jwks_cache["fetched_at"] < Config.JWT_JWKS_CACHE_SECONDS:
+        return _jwks_cache["keys"]
+    try:
+        resp = requests.get(Config.JWT_JWKS_URL, timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        _jwks_cache["keys"] = data
+        _jwks_cache["fetched_at"] = now
+        return data
+    except Exception:
+        return _jwks_cache["keys"]
+
+def _verify_jwt(token: str) -> bool:
+    try:
+        headers = jwt.get_unverified_header(token)
+    except Exception:
+        headers = {}
+    alg = (Config.JWT_ALG or "HS256").upper()
+    try:
+        if alg == "RS256" and Config.JWT_JWKS_URL:
+            jwks = _fetch_jwks()
+            if not jwks:
+                return False
+            kid = headers.get("kid")
+            key = None
+            for k in jwks.get("keys", []):
+                if k.get("kid") == kid:
+                    key = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(k))
+                    break
+            if not key:
+                return False
+            jwt.decode(
+                token,
+                key=key,
+                algorithms=["RS256"],
+                issuer=Config.JWT_ISSUER,
+                audience=Config.JWT_AUDIENCE,
+            )
+            return True
+        elif Config.JWT_SECRET:
+            jwt.decode(
+                token,
+                key=Config.JWT_SECRET,
+                algorithms=["HS256"],
+                issuer=Config.JWT_ISSUER,
+                audience=Config.JWT_AUDIENCE,
+            )
+            return True
+        else:
+            return False
+    except Exception:
+        return False
 
 @app.middleware("http")
 async def add_request_id_and_logging(request: Request, call_next):
@@ -112,12 +171,8 @@ def ask(req: AskReq, request: Request):
         if api_key != Config.API_KEY:
             # Allow JWT alternative if configured
             authz = request.headers.get("authorization", "")
-            if authz.lower().startswith("bearer ") and Config.JWT_SECRET:
-                token = authz.split(" ", 1)[1]
-                try:
-                    jwt.decode(token, Config.JWT_SECRET, algorithms=["HS256"], issuer=Config.JWT_ISSUER, audience=Config.JWT_AUDIENCE)
-                except Exception:
-                    raise HTTPException(status_code=401, detail="Invalid or missing API key/JWT")
+            if authz.lower().startswith("bearer ") and _verify_jwt(authz.split(" ", 1)[1]):
+                pass
             else:
                 raise HTTPException(status_code=401, detail="Invalid or missing API key/JWT")
     # Rate limiting
