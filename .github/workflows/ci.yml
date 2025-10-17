@@ -11,6 +11,32 @@ jobs:
         with: { python-version: "3.10" }
       - run: pip install -r requirements.txt
       - run: pytest -q
+  e2e:
+    needs: build-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.10" }
+      - run: pip install -r requirements.txt
+      - name: Start API (MOCK_MODE)
+        env:
+          METRICS_PUBLIC: "true"
+          MOCK_MODE: "true"
+          API_KEY: "TESTKEY"
+          PORT: "8000"
+        run: |
+          nohup python -m uvicorn src.app.fastapi_app:app --host 127.0.0.1 --port 8000 &
+          for i in {1..30}; do
+            curl -sf http://127.0.0.1:8000/ready && break || sleep 1;
+          done
+          curl -sSf http://127.0.0.1:8000/metrics | head -n 5
+      - name: Run smoke checks
+        env:
+          API_URL: "http://127.0.0.1:8000"
+          API_KEY: "TESTKEY"
+        run: |
+          python scripts/smoke.py
   docker:
     needs: build-test
     runs-on: ubuntu-latest
