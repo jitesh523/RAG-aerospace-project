@@ -38,3 +38,10 @@ def reload_app_with_env(**env) -> types.ModuleType:
 @pytest.fixture
 def appmod_factory():
     return reload_app_with_env
+
+
+@pytest.fixture(autouse=True)
+def default_metrics_public_true(monkeypatch):
+    """Default tests to METRICS_PUBLIC=true unless a test overrides via reload_app_with_env."""
+    monkeypatch.setenv("METRICS_PUBLIC", "true")
+    yield
