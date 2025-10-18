@@ -36,3 +36,6 @@ class Config:
     PUSHGATEWAY_URL = os.getenv("PUSHGATEWAY_URL")
     # Mock mode for e2e and CI (bypass LLM/retriever)
     MOCK_MODE = os.getenv("MOCK_MODE", "false").lower() == "true"
+    # Response cache
+    CACHE_ENABLED = os.getenv("CACHE_ENABLED", "false").lower() == "true"
+    CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))

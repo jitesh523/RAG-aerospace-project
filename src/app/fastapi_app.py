@@ -59,6 +59,9 @@ if Config.REDIS_URL:
         _redis.ping()
     except Exception:
         _redis = None
+    
+# Simple in-memory cache structure: key -> {v: response_json, t: epoch}
+_cache = {}
 
 # JWKS cache and verification helpers
 _jwks_cache = {"keys": None, "fetched_at": 0}
@@ -212,6 +215,21 @@ def ask(req: AskReq, request: Request):
         raise HTTPException(status_code=400, detail="Query too long (max 4000 chars)")
     if not READY or qa_chain is None:
         raise HTTPException(status_code=503, detail="Service not ready. Ingest documents to create ./faiss_store and restart.")
+    # Cache get (if enabled)
+    if Config.CACHE_ENABLED:
+        ckey = f"ask:{q}"
+        if _redis is not None:
+            try:
+                cached = _redis.get(ckey)
+                if cached:
+                    return json.loads(cached)
+            except Exception:
+                pass
+        else:
+            ent = _cache.get(ckey)
+            if ent and (time.time() - ent["t"]) < Config.CACHE_TTL_SECONDS:
+                return ent["v"]
+
     result = qa_chain.invoke(q)
     sources = [
         {
@@ -220,7 +238,18 @@ def ask(req: AskReq, request: Request):
         }
         for d in result["source_documents"]
     ]
-    return {"answer": result["result"], "sources": sources}
+    resp = {"answer": result["result"], "sources": sources}
+    # Cache set
+    if Config.CACHE_ENABLED:
+        ckey = f"ask:{q}"
+        if _redis is not None:
+            try:
+                _redis.setex(ckey, Config.CACHE_TTL_SECONDS, json.dumps(resp))
+            except Exception:
+                pass
+        else:
+            _cache[ckey] = {"v": resp, "t": time.time()}
+    return resp
 
 @app.get("/health")
 def health():
