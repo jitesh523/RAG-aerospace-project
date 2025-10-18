@@ -37,6 +37,19 @@ jobs:
           API_KEY: "TESTKEY"
         run: |
           python scripts/smoke.py
+      - name: Install k6
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y gnupg2 ca-certificates
+          curl -s https://dl.k6.io/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/k6-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update -y && sudo apt-get install -y k6
+      - name: Run k6 smoke
+        env:
+          API_URL: "http://127.0.0.1:8000"
+          API_KEY: "TESTKEY"
+        run: |
+          k6 run scripts/k6-smoke.js
   docker:
     needs: build-test
     runs-on: ubuntu-latest
