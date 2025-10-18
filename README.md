@@ -151,11 +151,6 @@ helm install rag-aerospace ./k8s/helm -n rag-aerospace
 
 ### 3. Probes, Access the Application
 
-The Helm chart configures:
-- Liveness probe -> `/health`
-- Readiness probe -> `/ready`
-
-```bash
 # Port forward for testing
 kubectl port-forward svc/rag-aerospace 8080:80 -n rag-aerospace
 
@@ -265,6 +260,11 @@ Key runtime settings:
 - `API_KEY`: if set, `/ask` requires header `x-api-key`. Also used to protect `/metrics` when `METRICS_PUBLIC=false`.
 - `METRICS_PUBLIC`: `true` to expose `/metrics` openly; `false` to require `API_KEY`.
 - `RATE_LIMIT_PER_MIN`: requests per minute per API key/IP for `/ask`.
+- `MOCK_MODE`: when `true`, API uses a fake chain for E2E/CI without external dependencies.
+- `CACHE_ENABLED`, `CACHE_TTL_SECONDS`: enable Redis/in-memory response cache for `/ask`.
+- `JWT_ALG`: `HS256` (default) or `RS256` for JWKS.
+- `JWT_JWKS_URL`, `JWT_JWKS_CACHE_SECONDS`: configure JWKS fetch/caching for RS256.
+- `REDIS_URL`: if set, enables Redis-backed rate limiting and cache.
 
 ### Key Settings
 - `EMBED_MODEL`: Choose embedding model (OpenAI vs HuggingFace)

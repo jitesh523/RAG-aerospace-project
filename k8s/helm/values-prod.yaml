@@ -1,0 +1,29 @@
+image:
+  repository: ghcr.io/YOUR_USER/rag-aerospace
+  tag: latest
+  pullPolicy: IfNotPresent
+
+redis:
+  enabled: true
+
+env:
+  - name: RETRIEVER_BACKEND
+    value: milvus
+  - name: METRICS_PUBLIC
+    value: "false"
+  - name: RATE_LIMIT_PER_MIN
+    value: "300"
+  - name: MILVUS_HOST
+    value: milvus-standalone.milvus.svc.cluster.local
+  - name: MILVUS_PORT
+    value: "19530"
+  - name: EMBED_MODEL
+    value: text-embedding-3-large
+  - name: REDIS_URL
+    value: "redis://rag-aerospace-redis-master:6379/0"
+  # API_KEY, JWT_*, and other secrets are expected via k8s Secret `api-secrets`
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8000
