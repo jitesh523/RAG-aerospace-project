@@ -1,0 +1,31 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rag-aerospace
+spec:
+  podSelector:
+    matchLabels:
+      app: rag-aerospace
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 80
+  egress:
+    - ports:
+        # DNS
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+        # Milvus (19530) and Redis (6379)
+        - protocol: TCP
+          port: 19530
+        - protocol: TCP
+          port: 6379
