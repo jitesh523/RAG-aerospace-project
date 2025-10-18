@@ -1,0 +1,41 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: rag-aerospace-rules
+  labels:
+    release: prometheus
+spec:
+  groups:
+    - name: rag-aerospace.slos
+      rules:
+        - alert: RAGVectorSearchP95High
+          expr: |
+            histogram_quantile(0.95, sum(rate(vector_search_duration_seconds_bucket[5m])) by (le)) > 1.0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Vector search p95 latency is high (>1s)"
+            description: "The 95th percentile of vector search latency exceeded 1s over 10 minutes."
+
+        - alert: RAGHighErrorRate
+          expr: |
+            sum(rate(starlette_requests_total{status=~"5.."}[5m]))
+            /
+            sum(rate(starlette_requests_total[5m])) > 0.05
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "HTTP 5xx error rate > 5%"
+            description: "High error rate observed across API endpoints in the last 10 minutes."
+
+        - alert: RAGReadinessFlapping
+          expr: |
+            sum(rate(starlette_requests_total{path="/ready",status!="200"}[5m])) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Readiness endpoint returning non-200"
+            description: "The /ready endpoint has been returning non-200 status codes for 5 minutes."
