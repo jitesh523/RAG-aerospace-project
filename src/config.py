@@ -39,3 +39,9 @@ class Config:
     # Response cache
     CACHE_ENABLED = os.getenv("CACHE_ENABLED", "false").lower() == "true"
     CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))
+    # OpenTelemetry tracing (optional)
+    OTEL_ENABLED = os.getenv("OTEL_ENABLED", "false").lower() == "true"
+    OTEL_EXPORTER_OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+    OTEL_SERVICE_NAME = os.getenv("OTEL_SERVICE_NAME", "rag-aerospace")
+    # Sentry error reporting (optional)
+    SENTRY_DSN = os.getenv("SENTRY_DSN")

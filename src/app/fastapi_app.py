@@ -13,13 +13,39 @@ import json
 import jwt
 import redis
 import requests
-
 from typing import Optional
+from opentelemetry import trace as ot_trace
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+import sentry_sdk
+from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
 
 app = FastAPI(title="Aerospace RAG API", version="1.0.0")
 
 # Metrics
 app.add_middleware(PrometheusMiddleware)
+"""Optional Sentry initialization"""
+if Config.SENTRY_DSN:
+    try:
+        sentry_sdk.init(dsn=Config.SENTRY_DSN, traces_sample_rate=0.0)
+        app.add_middleware(SentryAsgiMiddleware)
+    except Exception:
+        pass
+
+"""Optional OpenTelemetry tracing initialization"""
+_tracer = None
+if Config.OTEL_ENABLED and Config.OTEL_EXPORTER_OTLP_ENDPOINT:
+    try:
+        resource = Resource.create({"service.name": Config.OTEL_SERVICE_NAME})
+        provider = TracerProvider(resource=resource)
+        exporter = OTLPSpanExporter(endpoint=Config.OTEL_EXPORTER_OTLP_ENDPOINT)
+        provider.add_span_processor(BatchSpanProcessor(exporter))
+        ot_trace.set_tracer_provider(provider)
+        _tracer = ot_trace.get_tracer(__name__)
+    except Exception:
+        _tracer = None
 if Config.METRICS_PUBLIC:
     app.add_route("/metrics", handle_metrics)
 else:
@@ -168,6 +194,10 @@ def _startup():
 
 @app.post("/ask")
 def ask(req: AskReq, request: Request):
+    span_ctx = None
+    if _tracer is not None:
+        span_ctx = _tracer.start_as_current_span("ask")
+        span_ctx.__enter__()
     # Optional API key
     if Config.API_KEY:
         api_key = request.headers.get("x-api-key")
@@ -230,7 +260,15 @@ def ask(req: AskReq, request: Request):
             if ent and (time.time() - ent["t"]) < Config.CACHE_TTL_SECONDS:
                 return ent["v"]
 
-    result = qa_chain.invoke(q)
+    try:
+        if _tracer is not None:
+            cur = ot_trace.get_current_span()
+            cur.set_attribute("query.length", len(q))
+            cur.set_attribute("retriever.backend", os.getenv("RETRIEVER_BACKEND", Config.RETRIEVER_BACKEND))
+        result = qa_chain.invoke(q)
+    finally:
+        if span_ctx is not None:
+            span_ctx.__exit__(None, None, None)
     sources = [
         {
             "source": d.metadata.get("source", ""),
