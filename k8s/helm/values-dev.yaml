@@ -1,0 +1,24 @@
+image:
+  repository: ghcr.io/YOUR_USER/rag-aerospace
+  tag: latest
+  pullPolicy: IfNotPresent
+
+redis:
+  enabled: false
+
+env:
+  - name: RETRIEVER_BACKEND
+    value: faiss
+  - name: METRICS_PUBLIC
+    value: "true"
+  - name: RATE_LIMIT_PER_MIN
+    value: "60"
+  - name: EMBED_MODEL
+    value: text-embedding-3-large
+  - name: MOCK_MODE
+    value: "true"
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8000

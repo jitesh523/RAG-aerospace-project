@@ -161,17 +161,31 @@ kubectl port-forward svc/rag-aerospace 8080:80 -n rag-aerospace
 
 ### Metrics
 The application exposes Prometheus metrics at `/metrics`:
-- Request latency and throughput
-- Vector search performance
-- Error rates and types
+- Vector search latency histogram: `vector_search_duration_seconds`
+- Ingestion counter: `ingest_documents_total`
+- Starlette request metrics: `starlette_requests_total`, etc.
 
-You can restrict public access to `/metrics` by setting `METRICS_PUBLIC=false` and providing an `API_KEY`. In that mode, `/metrics` requires the header `x-api-key: <API_KEY>`.
+Grafana resources:
+- Dashboard: `docs/grafana/dashboard-api-overview.json`
+- Alerts: `docs/grafana/alerts.json`
+
+Runbooks:
+- `docs/runbooks/scaling.md`
+- `docs/runbooks/secrets.md`
+- `docs/runbooks/troubleshoot-readiness.md`
+- `docs/runbooks/rate-limiting.md`
 
 ### Health Checks
 - Readiness probe: `/ready` (verifies FAISS presence or Milvus connectivity and collection load)
 - Liveness probe: `/health`
 
-### Grafana Dashboard
+### OpenTelemetry Configuration
+- `OTEL_ENABLED`: enable OpenTelemetry tracing when `true`.
+- `OTEL_EXPORTER_OTLP_ENDPOINT`: OTLP endpoint (e.g., `http://otel-collector:4318/v1/traces`).
+- `OTEL_SERVICE_NAME`: service name for tracing; defaults to `rag-aerospace`.
+
+### Sentry Configuration
+- `SENTRY_DSN`: if set, enables Sentry ASGI middleware for error reporting.
 Create dashboards for:
 - API response times
 - Vector search latency
@@ -265,6 +279,10 @@ Key runtime settings:
 - `JWT_ALG`: `HS256` (default) or `RS256` for JWKS.
 - `JWT_JWKS_URL`, `JWT_JWKS_CACHE_SECONDS`: configure JWKS fetch/caching for RS256.
 - `REDIS_URL`: if set, enables Redis-backed rate limiting and cache.
+- `OTEL_ENABLED`: enable OpenTelemetry tracing when `true`.
+- `OTEL_EXPORTER_OTLP_ENDPOINT`: OTLP endpoint (e.g., `http://otel-collector:4318/v1/traces`).
+- `OTEL_SERVICE_NAME`: service name for tracing; defaults to `rag-aerospace`.
+- `SENTRY_DSN`: if set, enables Sentry ASGI middleware for error reporting.
 
 ### Key Settings
 - `EMBED_MODEL`: Choose embedding model (OpenAI vs HuggingFace)
