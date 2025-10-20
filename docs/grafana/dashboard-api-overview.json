@@ -36,6 +36,13 @@
       "targets": [
         {"expr": "sum(rate(ingest_documents_total[1m])) * 60"}
       ]
+    },
+    {
+      "type": "graph",
+      "title": "Rate Limited (429/s)",
+      "targets": [
+        {"expr": "sum(rate(starlette_requests_total{status=\"429\"}[1m]))"}
+      ]
     }
   ],
   "templating": {"list": []},
