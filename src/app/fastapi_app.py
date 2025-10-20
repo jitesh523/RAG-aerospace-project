@@ -22,7 +22,14 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 import sentry_sdk
 from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
 
-app = FastAPI(title="Aerospace RAG API", version="1.0.0")
+app = FastAPI(
+    title="Aerospace RAG API",
+    version="1.0.0",
+    description="API for question answering over aerospace documents using retrieval augmented generation.",
+    contact={"name": "Aerospace RAG Team"},
+    license_info={"name": "MIT"},
+    swagger_ui_parameters={"displayOperationId": True},
+)
 
 # Metrics
 app.add_middleware(PrometheusMiddleware)
@@ -64,6 +71,20 @@ else:
 
 class AskReq(BaseModel):
     query: str
+
+class SourceItem(BaseModel):
+    source: str
+    page: Optional[int] = None
+
+class AskResp(BaseModel):
+    answer: str
+    sources: list[SourceItem]
+
+class HealthResp(BaseModel):
+    status: str
+
+class ReadyResp(BaseModel):
+    ready: bool
 
 qa_chain = None
 READY = False
@@ -192,7 +213,13 @@ def _startup():
         READY = False
         qa_chain = None
 
-@app.post("/ask")
+@app.post(
+    "/ask",
+    response_model=AskResp,
+    tags=["Query"],
+    summary="Ask a question",
+    description="Returns an answer and source citations using the configured retriever and LLM.",
+)
 def ask(req: AskReq, request: Request):
     span_ctx = None
     if _tracer is not None:
@@ -289,13 +316,13 @@ def ask(req: AskReq, request: Request):
             _cache[ckey] = {"v": resp, "t": time.time()}
     return resp
 
-@app.get("/health")
+@app.get("/health", response_model=HealthResp, tags=["System"], summary="Liveness probe")
 def health():
     return {"status": "healthy"}
 
-@app.get("/ready")
+@app.get("/ready", response_model=ReadyResp, tags=["System"], summary="Readiness probe")
 def ready():
     if READY:
         return {"ready": True}
     # Not ready yet
-    raise HTTPException(status_code=503, detail="Not ready")
+    return {"ready": False}
