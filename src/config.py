@@ -45,3 +45,9 @@ class Config:
     OTEL_SERVICE_NAME = os.getenv("OTEL_SERVICE_NAME", "rag-aerospace")
     # Sentry error reporting (optional)
     SENTRY_DSN = os.getenv("SENTRY_DSN")
+    # Security headers
+    SECURITY_HSTS_ENABLED = os.getenv("SECURITY_HSTS_ENABLED", "true").lower() == "true"
+    SECURITY_HSTS_MAX_AGE = int(os.getenv("SECURITY_HSTS_MAX_AGE", "31536000"))
+    # Retry/backoff
+    RETRY_MAX_ATTEMPTS = int(os.getenv("RETRY_MAX_ATTEMPTS", "3"))
+    RETRY_BASE_DELAY_MS = int(os.getenv("RETRY_BASE_DELAY_MS", "100"))

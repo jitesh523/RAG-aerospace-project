@@ -3,7 +3,7 @@ from langchain_community.vectorstores import Milvus as LC_Milvus
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.chains import RetrievalQA
 from src.config import Config
-from prometheus_client import Histogram
+from prometheus_client import Histogram, Counter
 import time
 
 
@@ -11,6 +11,13 @@ import time
 VECTOR_SEARCH_DURATION = Histogram(
     "vector_search_duration_seconds",
     "Latency of retriever.get_relevant_documents",
+    labelnames=["backend"],
+)
+
+# Retry counter
+VECTOR_SEARCH_RETRIES = Counter(
+    "vector_search_retries_total",
+    "Total retries performed for vector search calls",
     labelnames=["backend"],
 )
 
@@ -24,11 +31,26 @@ class TimedRetriever:
 
     def get_relevant_documents(self, query):
         start = time.time()
-        try:
-            return self._inner.get_relevant_documents(query)
-        finally:
-            elapsed = time.time() - start
-            VECTOR_SEARCH_DURATION.labels(self._backend_label).observe(elapsed)
+        attempt = 0
+        delay = max(0.001, Config.RETRY_BASE_DELAY_MS / 1000.0)
+        last_exc = None
+        while attempt < max(1, Config.RETRY_MAX_ATTEMPTS):
+            try:
+                res = self._inner.get_relevant_documents(query)
+                elapsed = time.time() - start
+                VECTOR_SEARCH_DURATION.labels(self._backend_label).observe(elapsed)
+                return res
+            except Exception as e:
+                last_exc = e
+                attempt += 1
+                if attempt < Config.RETRY_MAX_ATTEMPTS:
+                    VECTOR_SEARCH_RETRIES.labels(self._backend_label).inc()
+                    time.sleep(delay)
+                    delay *= 2
+                else:
+                    elapsed = time.time() - start
+                    VECTOR_SEARCH_DURATION.labels(self._backend_label).observe(elapsed)
+                    raise
 
 def build_chain():
     if Config.MOCK_MODE:
