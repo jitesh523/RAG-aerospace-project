@@ -52,6 +52,74 @@ class TimedRetriever:
                     VECTOR_SEARCH_DURATION.labels(self._backend_label).observe(elapsed)
                     raise
 
+
+class HybridRetriever:
+    """Blend vector similarity with simple term-frequency scoring.
+
+    Uses vs.similarity_search_with_score(query, k=fetch_k) then re-ranks top-k by
+    blended score: alpha*vector_sim + (1-alpha)*tf_norm.
+    """
+
+    def __init__(self, vectorstore, backend_label: str):
+        self._vs = vectorstore
+        self._backend_label = backend_label
+
+    def _tf_score(self, query: str, doc_text: str) -> float:
+        q_terms = [t for t in (query or "").lower().split() if t]
+        if not q_terms:
+            return 0.0
+        text = (doc_text or "").lower()
+        return float(sum(text.count(t) for t in q_terms))
+
+    def get_relevant_documents(self, query: str):
+        start = time.time()
+        attempt = 0
+        delay = max(0.001, Config.RETRY_BASE_DELAY_MS / 1000.0)
+        while attempt < max(1, Config.RETRY_MAX_ATTEMPTS):
+            try:
+                # fetch_k for broader candidate set
+                fetch_k = max(Config.RETRIEVER_FETCH_K, Config.RETRIEVER_K)
+                pairs = self._vs.similarity_search_with_score(query, k=fetch_k)
+                # Extract distances/scores (lower is better) and convert to similarity
+                if not pairs:
+                    elapsed = time.time() - start
+                    VECTOR_SEARCH_DURATION.labels(self._backend_label).observe(elapsed)
+                    return []
+                dists = [p[1] for p in pairs]
+                dmin, dmax = min(dists), max(dists)
+                sims = []
+                for (doc, dist) in pairs:
+                    if dmax == dmin:
+                        v_sim = 1.0
+                    else:
+                        # Invert and normalize distance to similarity in [0,1]
+                        v_sim = (dmax - dist) / (dmax - dmin)
+                    tf = self._tf_score(query, getattr(doc, "page_content", ""))
+                    sims.append((doc, v_sim, tf))
+                # Normalize tf
+                tf_max = max([t for _, _, t in sims]) or 1.0
+                alpha = max(0.0, min(1.0, Config.HYBRID_ALPHA))
+                ranked = []
+                for doc, v_sim, tf in sims:
+                    tf_n = (tf / tf_max) if tf_max else 0.0
+                    blended = alpha * v_sim + (1 - alpha) * tf_n
+                    ranked.append((blended, doc))
+                ranked.sort(key=lambda x: x[0], reverse=True)
+                top_docs = [d for _, d in ranked[: Config.RETRIEVER_K]]
+                elapsed = time.time() - start
+                VECTOR_SEARCH_DURATION.labels(self._backend_label).observe(elapsed)
+                return top_docs
+            except Exception:
+                attempt += 1
+                if attempt < Config.RETRY_MAX_ATTEMPTS:
+                    VECTOR_SEARCH_RETRIES.labels(self._backend_label).inc()
+                    time.sleep(delay)
+                    delay *= 2
+                else:
+                    elapsed = time.time() - start
+                    VECTOR_SEARCH_DURATION.labels(self._backend_label).observe(elapsed)
+                    raise
+
 def build_chain():
     if Config.MOCK_MODE:
         class _FakeChain:
@@ -75,9 +143,12 @@ def build_chain():
         # Default to FAISS
         vs = FAISS.load_local("./faiss_store", embeddings=embeddings)
 
-    base_retriever = vs.as_retriever(
-        search_type="mmr",
-        search_kwargs={"k": Config.RETRIEVER_K, "fetch_k": Config.RETRIEVER_FETCH_K},
-    )
-    timed_retriever = TimedRetriever(base_retriever, backend_label=backend)
-    return RetrievalQA.from_chain_type(llm=llm, retriever=timed_retriever, return_source_documents=True)
+    if Config.HYBRID_ENABLED:
+        retriever = HybridRetriever(vs, backend_label=backend)
+    else:
+        base_retriever = vs.as_retriever(
+            search_type="mmr",
+            search_kwargs={"k": Config.RETRIEVER_K, "fetch_k": Config.RETRIEVER_FETCH_K},
+        )
+        retriever = TimedRetriever(base_retriever, backend_label=backend)
+    return RetrievalQA.from_chain_type(llm=llm, retriever=retriever, return_source_documents=True)

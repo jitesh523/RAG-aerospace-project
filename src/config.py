@@ -58,3 +58,6 @@ class Config:
     CORS_ALLOWED_HEADERS = [s.strip() for s in os.getenv("CORS_ALLOWED_HEADERS", "*").split(",")]
     # Reranking
     RERANK_ENABLED = os.getenv("RERANK_ENABLED", "false").lower() == "true"
+    # Hybrid search (vector + term scoring)
+    HYBRID_ENABLED = os.getenv("HYBRID_ENABLED", "false").lower() == "true"
+    HYBRID_ALPHA = float(os.getenv("HYBRID_ALPHA", "0.7"))
