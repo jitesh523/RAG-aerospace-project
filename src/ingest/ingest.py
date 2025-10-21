@@ -1,4 +1,4 @@
-import argparse, os, uuid
+import argparse, os, uuid, time
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
@@ -23,10 +23,28 @@ def chunk_docs(docs):
 # Prometheus counter for ingestion throughput (documents processed)
 INGEST_DOCS_TOTAL = Counter("ingest_documents_total", "Total documents/chunks ingested")
 
+INGEST_RETRIES = Counter(
+    "ingest_retries_total",
+    "Total retries performed during ingestion",
+    labelnames=["stage"],
+)
+
 def to_milvus_rows(chunks, embeddings):
     rows = []
     texts = [c.page_content for c in chunks]
-    embs = embeddings.embed_documents(texts)
+    attempt = 0
+    delay = max(0.001, Config.RETRY_BASE_DELAY_MS / 1000.0)
+    while True:
+        try:
+            embs = embeddings.embed_documents(texts)
+            break
+        except Exception:
+            attempt += 1
+            if attempt >= max(1, Config.RETRY_MAX_ATTEMPTS):
+                raise
+            INGEST_RETRIES.labels("embed").inc()
+            time.sleep(delay)
+            delay *= 2
     for emb, doc in zip(embs, chunks):
         rid = str(uuid.uuid4())[:32]
         src = doc.metadata.get("source", "")
@@ -46,7 +64,19 @@ def main(input_dir: str, batch_size: int):
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i:i+batch_size]
         rows = to_milvus_rows(batch, embeddings)
-        insert_rows(rows)
+        ins_attempt = 0
+        ins_delay = max(0.001, Config.RETRY_BASE_DELAY_MS / 1000.0)
+        while True:
+            try:
+                insert_rows(rows)
+                break
+            except Exception:
+                ins_attempt += 1
+                if ins_attempt >= max(1, Config.RETRY_MAX_ATTEMPTS):
+                    raise
+                INGEST_RETRIES.labels("insert").inc()
+                time.sleep(ins_delay)
+                ins_delay *= 2
         # metrics: increment counter and optionally push to Pushgateway
         INGEST_DOCS_TOTAL.inc(len(batch))
         if Config.PUSHGATEWAY_URL:
