@@ -21,6 +21,7 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 import sentry_sdk
 from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(
     title="Aerospace RAG API",
@@ -53,6 +54,30 @@ if Config.OTEL_ENABLED and Config.OTEL_EXPORTER_OTLP_ENDPOINT:
         _tracer = ot_trace.get_tracer(__name__)
     except Exception:
         _tracer = None
+
+# Basic security headers middleware
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("X-XSS-Protection", "0")
+    if Config.SECURITY_HSTS_ENABLED and request.url.scheme == "https":
+        response.headers.setdefault(
+            "Strict-Transport-Security",
+            f"max-age={Config.SECURITY_HSTS_MAX_AGE}; includeSubDomains; preload",
+        )
+    return response
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=Config.CORS_ALLOWED_ORIGINS,
+    allow_credentials=Config.CORS_ALLOW_CREDENTIALS,
+    allow_methods=Config.CORS_ALLOWED_METHODS,
+    allow_headers=Config.CORS_ALLOWED_HEADERS,
+)
 if Config.METRICS_PUBLIC:
     app.add_route("/metrics", handle_metrics)
 else:
@@ -296,12 +321,22 @@ def ask(req: AskReq, request: Request):
     finally:
         if span_ctx is not None:
             span_ctx.__exit__(None, None, None)
+    docs = result["source_documents"]
+    if Config.RERANK_ENABLED:
+        q_terms = [t for t in q.lower().split() if t]
+        def _score(doc):
+            text = getattr(doc, "page_content", "").lower()
+            return sum(text.count(t) for t in q_terms)
+        try:
+            docs = sorted(docs, key=_score, reverse=True)
+        except Exception:
+            docs = result["source_documents"]
     sources = [
         {
             "source": d.metadata.get("source", ""),
             "page": d.metadata.get("page", None),
         }
-        for d in result["source_documents"]
+        for d in docs
     ]
     resp = {"answer": result["result"], "sources": sources}
     # Cache set

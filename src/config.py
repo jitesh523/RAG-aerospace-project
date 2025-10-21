@@ -51,3 +51,10 @@ class Config:
     # Retry/backoff
     RETRY_MAX_ATTEMPTS = int(os.getenv("RETRY_MAX_ATTEMPTS", "3"))
     RETRY_BASE_DELAY_MS = int(os.getenv("RETRY_BASE_DELAY_MS", "100"))
+    # CORS
+    CORS_ALLOWED_ORIGINS = [s.strip() for s in os.getenv("CORS_ALLOWED_ORIGINS", "*").split(",")]
+    CORS_ALLOW_CREDENTIALS = os.getenv("CORS_ALLOW_CREDENTIALS", "false").lower() == "true"
+    CORS_ALLOWED_METHODS = [s.strip() for s in os.getenv("CORS_ALLOWED_METHODS", "GET,POST,OPTIONS").split(",")]
+    CORS_ALLOWED_HEADERS = [s.strip() for s in os.getenv("CORS_ALLOWED_HEADERS", "*").split(",")]
+    # Reranking
+    RERANK_ENABLED = os.getenv("RERANK_ENABLED", "false").lower() == "true"
