@@ -164,6 +164,9 @@ The application exposes Prometheus metrics at `/metrics`:
 - Vector search latency histogram: `vector_search_duration_seconds`
 - Ingestion counter: `ingest_documents_total`
 - Starlette request metrics: `starlette_requests_total`, etc.
+- Retry counters:
+  - `vector_search_retries_total{backend}`
+  - `ingest_retries_total{stage="embed|insert"}`
 
 Grafana resources:
 - Dashboard: `docs/grafana/dashboard-api-overview.json`
@@ -283,6 +286,10 @@ Key runtime settings:
 - `OTEL_EXPORTER_OTLP_ENDPOINT`: OTLP endpoint (e.g., `http://otel-collector:4318/v1/traces`).
 - `OTEL_SERVICE_NAME`: service name for tracing; defaults to `rag-aerospace`.
 - `SENTRY_DSN`: if set, enables Sentry ASGI middleware for error reporting.
+- `SECURITY_HSTS_ENABLED`, `SECURITY_HSTS_MAX_AGE`: control HSTS header behavior.
+- `RETRY_MAX_ATTEMPTS`, `RETRY_BASE_DELAY_MS`: exponential backoff settings for vector search and ingestion.
+- `CORS_ALLOWED_ORIGINS`, `CORS_ALLOW_CREDENTIALS`, `CORS_ALLOWED_METHODS`, `CORS_ALLOWED_HEADERS`: CORS configuration.
+- `RERANK_ENABLED`: when `true`, applies a lightweight query-term based rerank to sources.
 
 ### Key Settings
 - `EMBED_MODEL`: Choose embedding model (OpenAI vs HuggingFace)
