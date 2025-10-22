@@ -43,6 +43,27 @@
       "targets": [
         {"expr": "sum(rate(starlette_requests_total{status=\"429\"}[1m]))"}
       ]
+    },
+    {
+      "type": "graph",
+      "title": "Ask Retries (count)",
+      "targets": [
+        {"expr": "sum(ask_retries_total)"}
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Vector Search Retries (by backend)",
+      "targets": [
+        {"expr": "sum by (backend) (vector_search_retries_total)"}
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Ingest Retries (embed vs insert)",
+      "targets": [
+        {"expr": "sum by (stage) (ingest_retries_total)"}
+      ]
     }
   ],
   "templating": {"list": []},
