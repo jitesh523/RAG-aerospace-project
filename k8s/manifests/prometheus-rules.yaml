@@ -39,3 +39,45 @@ spec:
           annotations:
             summary: "Readiness endpoint returning non-200"
             description: "The /ready endpoint has been returning non-200 status codes for 5 minutes."
+
+        # Burn-rate style latency alerts (fast/slow)
+        - alert: RAGAskLatencyFastBurn
+          expr: |
+            histogram_quantile(0.95, sum(rate(vector_search_duration_seconds_bucket[5m])) by (le)) > 1.0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Fast burn: /ask p95 latency > 1s (5m)"
+            description: "Short-window breach suggests acute latency spike. Investigate Milvus/LLM/retriever."
+
+        - alert: RAGAskLatencySlowBurn
+          expr: |
+            histogram_quantile(0.95, sum(rate(vector_search_duration_seconds_bucket[1h])) by (le)) > 1.0
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "Slow burn: /ask p95 latency > 1s (1h)"
+            description: "Long-window breach indicates sustained latency. Plan capacity or tuning."
+
+        # Burn-rate style error-rate alerts (fast/slow)
+        - alert: RAGAskErrorRateFastBurn
+          expr: |
+            sum(rate(starlette_requests_total{status=~"5.."}[5m])) / sum(rate(starlette_requests_total[5m])) > 0.1
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Fast burn: 5xx > 10% (5m)"
+            description: "Short-window 5xx spike, investigate app/LLM/Milvus."
+
+        - alert: RAGAskErrorRateSlowBurn
+          expr: |
+            sum(rate(starlette_requests_total{status=~"5.."}[1h])) / sum(rate(starlette_requests_total[1h])) > 0.05
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "Slow burn: 5xx > 5% (1h)"
+            description: "Sustained elevated 5xx rate over 1h."
