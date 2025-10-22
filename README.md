@@ -85,6 +85,37 @@ curl -X POST "http://localhost:8000/ask" \
   -d '{"query":"Explain thermal stress analysis in aerospace engines"}'
 ```
 
+## 🧪 Quick Test
+art (Local Development)
+
+### Prerequisites
+- Python 3.10+
+- Docker & Docker Compose
+- OpenAI API Key
+
+### 2. Deploy with Helm
+
+```bash
+python scripts/smoke.py
+```
+
+### SDK Examples
+
+Python (`clients/python/rag_client.py`):
+```python
+from clients.python.rag_client import RAGClient
+client = RAGClient(base_url="http://127.0.0.1:8000", api_key="YOUR_API_KEY")
+print(client.ask("What is thrust-to-weight ratio?"))
+```
+
+JavaScript (`clients/js/ragClient.js`):
+```js
+import { RAGClient } from "./clients/js/ragClient.js";
+const client = new RAGClient({ baseUrl: "http://127.0.0.1:8000", apiKey: "YOUR_API_KEY" });
+const res = await client.ask("What is thrust-to-weight ratio?");
+console.log(res);
+```
+
 ## 🛠️ Development
 
 ### Project Structure
@@ -290,6 +321,7 @@ Key runtime settings:
 - `RETRY_MAX_ATTEMPTS`, `RETRY_BASE_DELAY_MS`: exponential backoff settings for vector search and ingestion.
 - `CORS_ALLOWED_ORIGINS`, `CORS_ALLOW_CREDENTIALS`, `CORS_ALLOWED_METHODS`, `CORS_ALLOWED_HEADERS`: CORS configuration.
 - `RERANK_ENABLED`: when `true`, applies a lightweight query-term based rerank to sources.
+- `HYBRID_ENABLED`, `HYBRID_ALPHA`: enable hybrid retrieval (vector + term frequency) and control blend weight (0..1).
 
 ### Key Settings
 - `EMBED_MODEL`: Choose embedding model (OpenAI vs HuggingFace)
