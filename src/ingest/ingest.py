@@ -5,7 +5,22 @@ from langchain_openai import OpenAIEmbeddings
 from src.index.faiss_index import build_faiss
 from src.index.milvus_index import insert_rows
 from src.config import Config
-from prometheus_client import Counter, CollectorRegistry, pushadd_to_gateway, REGISTRY
+from prometheus_client import Counter, Histogram, CollectorRegistry, pushadd_to_gateway, REGISTRY
+
+EMBED_BATCHES_TOTAL = Counter(
+    "embed_batches_total",
+    "Total embedding batches processed",
+)
+
+EMBED_ITEMS_TOTAL = Counter(
+    "embed_items_total",
+    "Total items embedded",
+)
+
+EMBED_BATCH_DURATION = Histogram(
+    "embed_batch_duration_seconds",
+    "Duration of embedding batches",
+)
 
 def load_pdfs(input_dir: str):
     docs = []
@@ -32,19 +47,28 @@ INGEST_RETRIES = Counter(
 def to_milvus_rows(chunks, embeddings):
     rows = []
     texts = [c.page_content for c in chunks]
-    attempt = 0
-    delay = max(0.001, Config.RETRY_BASE_DELAY_MS / 1000.0)
-    while True:
-        try:
-            embs = embeddings.embed_documents(texts)
-            break
-        except Exception:
-            attempt += 1
-            if attempt >= max(1, Config.RETRY_MAX_ATTEMPTS):
-                raise
-            INGEST_RETRIES.labels("embed").inc()
-            time.sleep(delay)
-            delay *= 2
+    embs = []
+    bs = max(1, Config.EMBED_BATCH_SIZE)
+    for i in range(0, len(texts), bs):
+        t_batch = texts[i:i+bs]
+        attempt = 0
+        delay = max(0.001, Config.RETRY_BASE_DELAY_MS / 1000.0)
+        start = time.time()
+        while True:
+            try:
+                part = embeddings.embed_documents(t_batch)
+                break
+            except Exception:
+                attempt += 1
+                if attempt >= max(1, Config.RETRY_MAX_ATTEMPTS):
+                    raise
+                INGEST_RETRIES.labels("embed").inc()
+                time.sleep(delay)
+                delay *= 2
+        EMBED_BATCH_DURATION.observe(time.time() - start)
+        EMBED_BATCHES_TOTAL.inc()
+        EMBED_ITEMS_TOTAL.inc(len(t_batch))
+        embs.extend(part)
     for emb, doc in zip(embs, chunks):
         rid = str(uuid.uuid4())[:32]
         src = doc.metadata.get("source", "")

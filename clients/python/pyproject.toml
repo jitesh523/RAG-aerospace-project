@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rag-aerospace-client"
+version = "0.1.0"
+description = "Python client for Aerospace RAG API"
+authors = [{name = "Aerospace RAG Team"}]
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["requests>=2.31"]
+
+[project.urls]
+Homepage = "https://github.com/jitesh523/RAG-aerospace-project"
+
+[tool.setuptools]
+packages = ["clients.python"]
+
+[tool.setuptools.package-dir]
+"clients.python" = "clients/python"

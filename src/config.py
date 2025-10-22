@@ -61,3 +61,5 @@ class Config:
     # Hybrid search (vector + term scoring)
     HYBRID_ENABLED = os.getenv("HYBRID_ENABLED", "false").lower() == "true"
     HYBRID_ALPHA = float(os.getenv("HYBRID_ALPHA", "0.7"))
+    # Embedding batching controls
+    EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "64"))
