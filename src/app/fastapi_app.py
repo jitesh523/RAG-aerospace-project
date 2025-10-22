@@ -1,3 +1,8 @@
+# Prometheus: retries for LLM/ask
+ASK_RETRIES = Counter(
+    "ask_retries_total",
+    "Total retries performed for LLM invocations in /ask",
+)
 from fastapi import FastAPI
 from pydantic import BaseModel
 from starlette_exporter import PrometheusMiddleware, handle_metrics
@@ -22,6 +27,7 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 import sentry_sdk
 from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
 from fastapi.middleware.cors import CORSMiddleware
+from prometheus_client import Counter
 
 app = FastAPI(
     title="Aerospace RAG API",
@@ -229,7 +235,19 @@ def _startup():
         # Basic readiness check: FAISS store presence + chain built
         faiss_path_exists = os.path.isdir("./faiss_store")
         if Config.RETRIEVER_BACKEND == "milvus":
-            milvus = check_milvus_readiness()
+            # Retry Milvus readiness with backoff
+            attempt = 0
+            delay = max(0.001, Config.RETRY_BASE_DELAY_MS / 1000.0)
+            while True:
+                try:
+                    milvus = check_milvus_readiness()
+                    break
+                except Exception:
+                    attempt += 1
+                    if attempt >= max(1, Config.RETRY_MAX_ATTEMPTS):
+                        raise
+                    time.sleep(delay)
+                    delay *= 2
             READY = qa_chain is not None and milvus.get("connected") and milvus.get("has_collection") and milvus.get("loaded")
         else:
             READY = qa_chain is not None and faiss_path_exists
@@ -312,15 +330,29 @@ def ask(req: AskReq, request: Request):
             if ent and (time.time() - ent["t"]) < Config.CACHE_TTL_SECONDS:
                 return ent["v"]
 
-    try:
-        if _tracer is not None:
-            cur = ot_trace.get_current_span()
-            cur.set_attribute("query.length", len(q))
-            cur.set_attribute("retriever.backend", os.getenv("RETRIEVER_BACKEND", Config.RETRIEVER_BACKEND))
-        result = qa_chain.invoke(q)
-    finally:
-        if span_ctx is not None:
-            span_ctx.__exit__(None, None, None)
+    # LLM invocation with retry/backoff
+    attempt = 0
+    delay = max(0.001, Config.RETRY_BASE_DELAY_MS / 1000.0)
+    result = None
+    while True:
+        try:
+            if _tracer is not None:
+                cur = ot_trace.get_current_span()
+                cur.set_attribute("query.length", len(q))
+                cur.set_attribute("retriever.backend", os.getenv("RETRIEVER_BACKEND", Config.RETRIEVER_BACKEND))
+            result = qa_chain.invoke(q)
+            break
+        except Exception:
+            attempt += 1
+            if attempt >= max(1, Config.RETRY_MAX_ATTEMPTS):
+                if span_ctx is not None:
+                    span_ctx.__exit__(None, None, None)
+                raise
+            ASK_RETRIES.inc()
+            time.sleep(delay)
+            delay *= 2
+    if span_ctx is not None:
+        span_ctx.__exit__(None, None, None)
     docs = result["source_documents"]
     if Config.RERANK_ENABLED:
         q_terms = [t for t in q.lower().split() if t]
