@@ -1,0 +1,3 @@
+{"query": "What is thrust-to-weight ratio?", "expected_sources": ["doc1.pdf"], "keywords": ["thrust", "weight", "ratio"]}
+{"query": "Explain thermal stress in turbine blades", "expected_sources": ["turbine.pdf"], "keywords": ["thermal", "stress", "turbine", "blades"]}
+{"query": "Define stall margin", "expected_sources": ["aero_handbook.pdf"], "keywords": ["stall", "margin"]}
