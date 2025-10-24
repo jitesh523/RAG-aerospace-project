@@ -1,0 +1,23 @@
+{
+  "name": "@rag-aerospace/client",
+  "version": "0.1.0",
+  "description": "JavaScript client for Aerospace RAG API",
+  "type": "module",
+  "main": "ragClient.js",
+  "module": "ragClient.js",
+  "exports": {
+    ".": "./ragClient.js"
+  },
+  "files": [
+    "ragClient.js",
+    "README.md"
+  ],
+  "keywords": ["rag", "aerospace", "client", "ai", "retrieval"],
+  "author": "Aerospace RAG Team",
+  "license": "MIT",
+  "scripts": {
+    "lint": "echo 'no lint configured'",
+    "test": "echo 'no tests'",
+    "prepublishOnly": "npm run lint && npm run test"
+  }
+}
