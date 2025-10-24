@@ -21,6 +21,14 @@ env:
     value: text-embedding-3-large
   - name: REDIS_URL
     value: "redis://rag-aerospace-redis-master:6379/0"
+  # CORS default-deny: set explicit allow-list (comma-separated)
+  - name: CORS_ALLOWED_ORIGINS
+    value: "https://app.example.com,https://admin.example.com"
+  - name: CORS_ALLOW_CREDENTIALS
+    value: "false"
+  # Optional CSP example (adjust to your frontend origins)
+  - name: CONTENT_SECURITY_POLICY
+    value: "default-src 'none'; connect-src 'self' https://app.example.com https://admin.example.com; img-src 'self'; script-src 'none'; style-src 'none'; frame-ancestors 'none'"
   # API_KEY, JWT_*, and other secrets are expected via k8s Secret `api-secrets`
 
 service:
