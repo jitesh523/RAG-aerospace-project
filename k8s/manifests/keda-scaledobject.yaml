@@ -1,0 +1,25 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: rag-aerospace-autoscaling
+  namespace: rag-aerospace
+spec:
+  scaleTargetRef:
+    name: rag-aerospace
+  pollingInterval: 30
+  cooldownPeriod: 120
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  triggers:
+    # CPU-based autoscaling (average utilization % across pods)
+    - type: cpu
+      metadata:
+        type: Utilization
+        value: "70"
+    # Optional Prometheus QPS-based autoscaling. Adjust serverAddress and threshold to taste.
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus-server.monitoring.svc.cluster.local
+        metricName: http_qps
+        query: sum(rate(starlette_requests_total[1m]))
+        threshold: "5"
