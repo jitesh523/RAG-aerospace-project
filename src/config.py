@@ -69,3 +69,6 @@ class Config:
     STREAMING_ENABLED = os.getenv("STREAMING_ENABLED", "false").lower() == "true"
     GZIP_ENABLED = os.getenv("GZIP_ENABLED", "true").lower() == "true"
     MAX_REQUEST_BYTES = int(os.getenv("MAX_REQUEST_BYTES", "1048576"))  # 1 MiB
+    # Quotas
+    QUOTA_ENABLED = os.getenv("QUOTA_ENABLED", "false").lower() == "true"
+    QUOTA_DAILY_LIMIT = int(os.getenv("QUOTA_DAILY_LIMIT", "1000"))

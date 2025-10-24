@@ -8,10 +8,41 @@ def require_auth(request: Request) -> None:
     if authz.lower().startswith("bearer ") and _verify_jwt(authz.split(" ", 1)[1]):
         return
     raise HTTPException(status_code=401, detail="Invalid or missing API key/JWT")
+
+def _tenant_from_key(api_key: str | None) -> str:
+    if not api_key:
+        return "anon"
+    try:
+        return str(uuid.uuid5(uuid.NAMESPACE_DNS, api_key))[:8]
+    except Exception:
+        return "anon"
+
+def _quota_inc_and_check(key_label: str) -> int:
+    day = int(time.time()) // 86400
+    if _redis is not None:
+        qkey = f"quota:{key_label}:{day}"
+        try:
+            newv = _redis.incr(qkey)
+            if newv == 1:
+                _redis.expire(qkey, 90000)
+            return int(newv)
+        except Exception:
+            pass
+    st = _rate_state.get(f"q:{key_label}")
+    if not st or st.get("day") != day:
+        st = {"day": day, "count": 0}
+    st["count"] += 1
+    _rate_state[f"q:{key_label}"] = st
+    return st["count"]
 # Prometheus: retries for LLM/ask
 ASK_RETRIES = Counter(
     "ask_retries_total",
     "Total retries performed for LLM invocations in /ask",
+)
+ASK_USAGE_TOTAL = Counter(
+    "ask_usage_total",
+    "Total /ask requests counted towards quota",
+    labelnames=["tenant"],
 )
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -131,6 +162,10 @@ class SourceItem(BaseModel):
 class AskResp(BaseModel):
     answer: str
     sources: list[SourceItem]
+
+class UsageResp(BaseModel):
+    limit: int
+    used_today: int
 
 class HealthResp(BaseModel):
     status: str
@@ -292,7 +327,8 @@ def ask(req: AskReq, request: Request):
     # Authorization (optional, enabled when API_KEY is set)
     require_auth(request)
     # Rate limiting
-    key = request.headers.get("x-api-key") or (request.client.host if request.client else "unknown")
+    api_key_hdr = request.headers.get("x-api-key")
+    key = api_key_hdr or (request.client.host if request.client else "unknown")
     now = int(time.time())
     window = now // 60
     if _redis is not None:
@@ -320,6 +356,13 @@ def ask(req: AskReq, request: Request):
         _rate_state[key] = st
         if st["count"] > Config.RATE_LIMIT_PER_MIN:
             raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    # Quota check
+    if Config.QUOTA_ENABLED:
+        tenant = _tenant_from_key(api_key_hdr)
+        used = _quota_inc_and_check(tenant)
+        ASK_USAGE_TOTAL.labels(tenant=tenant).inc()
+        if used > Config.QUOTA_DAILY_LIMIT:
+            raise HTTPException(status_code=429, detail="Daily quota exceeded")
 
     q = (req.query or "").strip()
     if not q:
@@ -477,3 +520,24 @@ def ready():
         return {"ready": True}
     # Not ready yet
     return {"ready": False}
+
+@app.get("/usage", response_model=UsageResp, tags=["System"], summary="Usage and quota for caller")
+def usage(request: Request):
+    require_auth(request)
+    api_key_hdr = request.headers.get("x-api-key")
+    tenant = _tenant_from_key(api_key_hdr)
+    if not Config.QUOTA_ENABLED:
+        return {"limit": 0, "used_today": 0}
+    # read current without increment
+    day = int(time.time()) // 86400
+    used = 0
+    if _redis is not None:
+        try:
+            val = _redis.get(f"quota:{tenant}:{day}")
+            used = int(val) if val else 0
+        except Exception:
+            used = 0
+    else:
+        st = _rate_state.get(f"q:{tenant}") or {}
+        used = int(st.get("count", 0)) if st.get("day") == day else 0
+    return {"limit": Config.QUOTA_DAILY_LIMIT, "used_today": used}
