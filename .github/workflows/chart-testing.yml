@@ -1,0 +1,21 @@
+name: Helm Chart Lint
+on:
+  pull_request:
+    paths:
+      - 'k8s/helm/**'
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.4
+      - name: Install chart-testing
+        uses: helm/chart-testing-action@v2.6.1
+      - name: Run ct lint
+        run: |
+          ct lint --charts k8s/helm --validate-maintainers=false --check-version-increment=false --print-config
