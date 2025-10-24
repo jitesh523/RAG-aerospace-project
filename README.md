@@ -116,6 +116,16 @@ const res = await client.ask("What is thrust-to-weight ratio?");
 console.log(res);
 ```
 
+### Streaming (SSE)
+
+When `STREAMING_ENABLED=true`, you can stream answers via Server-Sent Events:
+
+```bash
+curl -N "http://localhost:8000/ask/stream?query=Explain%20stall%20margin" \
+  -H "x-api-key: $API_KEY"
+```
+Events include an initial `sources` event followed by `data` chunks and a final `done` event.
+
 ## 🛠️ Development
 
 ### Project Structure
@@ -322,6 +332,8 @@ Key runtime settings:
 - `CORS_ALLOWED_ORIGINS`, `CORS_ALLOW_CREDENTIALS`, `CORS_ALLOWED_METHODS`, `CORS_ALLOWED_HEADERS`: CORS configuration.
 - `RERANK_ENABLED`: when `true`, applies a lightweight query-term based rerank to sources.
 - `HYBRID_ENABLED`, `HYBRID_ALPHA`: enable hybrid retrieval (vector + term frequency) and control blend weight (0..1).
+ - `STREAMING_ENABLED`, `GZIP_ENABLED`, `MAX_REQUEST_BYTES`: enable SSE endpoint, toggle gzip, and enforce request size limits.
+ - `CONTENT_SECURITY_POLICY`: optional CSP header value.
 
 ### Key Settings
 - `EMBED_MODEL`: Choose embedding model (OpenAI vs HuggingFace)
