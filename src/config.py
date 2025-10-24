@@ -65,3 +65,7 @@ class Config:
     HYBRID_ALPHA = float(os.getenv("HYBRID_ALPHA", "0.7"))
     # Embedding batching controls
     EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "64"))
+    # Streaming & compression & limits
+    STREAMING_ENABLED = os.getenv("STREAMING_ENABLED", "false").lower() == "true"
+    GZIP_ENABLED = os.getenv("GZIP_ENABLED", "true").lower() == "true"
+    MAX_REQUEST_BYTES = int(os.getenv("MAX_REQUEST_BYTES", "1048576"))  # 1 MiB

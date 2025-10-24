@@ -37,6 +37,8 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 import sentry_sdk
 from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from starlette.responses import StreamingResponse, PlainTextResponse
 from prometheus_client import Counter
 
 app = FastAPI(
@@ -96,6 +98,21 @@ app.add_middleware(
     allow_methods=Config.CORS_ALLOWED_METHODS,
     allow_headers=Config.CORS_ALLOWED_HEADERS,
 )
+# GZip compression (optional)
+if Config.GZIP_ENABLED:
+    app.add_middleware(GZipMiddleware, minimum_size=500)
+
+# Request size limit middleware
+@app.middleware("http")
+async def limit_request_size(request: Request, call_next):
+    cl = request.headers.get("content-length")
+    if cl is not None:
+        try:
+            if int(cl) > Config.MAX_REQUEST_BYTES:
+                return PlainTextResponse("Request entity too large", status_code=413)
+        except Exception:
+            pass
+    return await call_next(request)
 if Config.METRICS_PUBLIC:
     app.add_route("/metrics", handle_metrics)
 else:
@@ -378,6 +395,77 @@ def ask(req: AskReq, request: Request):
         else:
             _cache[ckey] = {"v": resp, "t": time.time()}
     return resp
+
+# SSE streaming endpoint (flag-gated)
+@app.get("/ask/stream")
+def ask_stream(query: str, request: Request):
+    if not Config.STREAMING_ENABLED:
+        raise HTTPException(status_code=404, detail="Streaming disabled")
+    # Authorization (optional)
+    require_auth(request)
+    # Basic rate limiting (reuse same as /ask)
+    key = request.headers.get("x-api-key") or (request.client.host if request.client else "unknown")
+    now = int(time.time())
+    window = now // 60
+    if _redis is not None:
+        rl_key = f"rl:{key}:{window}"
+        try:
+            newv = _redis.incr(rl_key)
+            if newv == 1:
+                _redis.expire(rl_key, 65)
+            if newv > Config.RATE_LIMIT_PER_MIN:
+                raise HTTPException(status_code=429, detail="Rate limit exceeded")
+        except Exception:
+            st = _rate_state.get(key)
+            if not st or st["window"] != window:
+                st = {"window": window, "count": 0}
+            st["count"] += 1
+            _rate_state[key] = st
+            if st["count"] > Config.RATE_LIMIT_PER_MIN:
+                raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    else:
+        st = _rate_state.get(key)
+        if not st or st["window"] != window:
+            st = {"window": window, "count": 0}
+        st["count"] += 1
+        _rate_state[key] = st
+        if st["count"] > Config.RATE_LIMIT_PER_MIN:
+            raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
+    q = (query or "").strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="Query must not be empty")
+    if len(q) > 4000:
+        raise HTTPException(status_code=400, detail="Query too long (max 4000 chars)")
+
+    def _gen():
+        # compute once, then stream in chunks
+        try:
+            result = qa_chain.invoke(q)
+            full = result.get("result", "")
+            docs = result.get("source_documents", [])
+            # first send sources metadata
+            srcs = []
+            for d in docs:
+                srcs.append({"source": d.metadata.get("source", ""), "page": d.metadata.get("page", None)})
+            yield f"event: sources\ndata: {json.dumps(srcs)}\n\n"
+            # stream answer in small chunks
+            chunk = []
+            count = 0
+            for ch in full.split():
+                chunk.append(ch)
+                count += len(ch) + 1
+                if count >= 128:
+                    yield f"data: {' '.join(chunk)}\n\n"
+                    chunk = []
+                    count = 0
+            if chunk:
+                yield f"data: {' '.join(chunk)}\n\n"
+            yield "event: done\ndata: [DONE]\n\n"
+        except Exception as e:
+            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+
+    return StreamingResponse(_gen(), media_type="text/event-stream")
 
 @app.get("/health", response_model=HealthResp, tags=["System"], summary="Liveness probe")
 def health():
