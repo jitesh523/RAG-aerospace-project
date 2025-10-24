@@ -1,3 +1,13 @@
+def require_auth(request: Request) -> None:
+    if not Config.API_KEY:
+        return
+    api_key = request.headers.get("x-api-key")
+    if api_key == Config.API_KEY:
+        return
+    authz = request.headers.get("authorization", "")
+    if authz.lower().startswith("bearer ") and _verify_jwt(authz.split(" ", 1)[1]):
+        return
+    raise HTTPException(status_code=401, detail="Invalid or missing API key/JWT")
 # Prometheus: retries for LLM/ask
 ASK_RETRIES = Counter(
     "ask_retries_total",
@@ -69,6 +79,8 @@ async def security_headers(request: Request, call_next):
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
     response.headers.setdefault("X-XSS-Protection", "0")
+    if Config.CONTENT_SECURITY_POLICY:
+        response.headers.setdefault("Content-Security-Policy", Config.CONTENT_SECURITY_POLICY)
     if Config.SECURITY_HSTS_ENABLED and request.url.scheme == "https":
         response.headers.setdefault(
             "Strict-Transport-Security",
@@ -89,15 +101,7 @@ if Config.METRICS_PUBLIC:
 else:
     @app.get("/metrics")
     def metrics(request: Request):
-        # Allow if API key matches or JWT is valid
-        api_key = request.headers.get("x-api-key")
-        authz = request.headers.get("authorization", "")
-        jwt_ok = False
-        if authz.lower().startswith("bearer "):
-            token = authz.split(" ", 1)[1]
-            jwt_ok = _verify_jwt(token)
-        if not ((Config.API_KEY and api_key == Config.API_KEY) or jwt_ok):
-            raise HTTPException(status_code=403, detail="Forbidden")
+        require_auth(request)
         return handle_metrics(request)
 
 class AskReq(BaseModel):
@@ -268,16 +272,8 @@ def ask(req: AskReq, request: Request):
     if _tracer is not None:
         span_ctx = _tracer.start_as_current_span("ask")
         span_ctx.__enter__()
-    # Optional API key
-    if Config.API_KEY:
-        api_key = request.headers.get("x-api-key")
-        if api_key != Config.API_KEY:
-            # Allow JWT alternative if configured
-            authz = request.headers.get("authorization", "")
-            if authz.lower().startswith("bearer ") and _verify_jwt(authz.split(" ", 1)[1]):
-                pass
-            else:
-                raise HTTPException(status_code=401, detail="Invalid or missing API key/JWT")
+    # Authorization (optional, enabled when API_KEY is set)
+    require_auth(request)
     # Rate limiting
     key = request.headers.get("x-api-key") or (request.client.host if request.client else "unknown")
     now = int(time.time())

@@ -48,6 +48,8 @@ class Config:
     # Security headers
     SECURITY_HSTS_ENABLED = os.getenv("SECURITY_HSTS_ENABLED", "true").lower() == "true"
     SECURITY_HSTS_MAX_AGE = int(os.getenv("SECURITY_HSTS_MAX_AGE", "31536000"))
+    # Content Security Policy (optional)
+    CONTENT_SECURITY_POLICY = os.getenv("CONTENT_SECURITY_POLICY", "")
     # Retry/backoff
     RETRY_MAX_ATTEMPTS = int(os.getenv("RETRY_MAX_ATTEMPTS", "3"))
     RETRY_BASE_DELAY_MS = int(os.getenv("RETRY_BASE_DELAY_MS", "100"))
