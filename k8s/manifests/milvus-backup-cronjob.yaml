@@ -1,0 +1,62 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: milvus-backup
+  namespace: rag-aerospace
+spec:
+  schedule: "0 2 * * *" # daily at 02:00
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: ghcr.io/curlimages/curl:8.8.0
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh","/scripts/backup.sh"]
+              env:
+                - name: MILVUS_HOST
+                  valueFrom:
+                    configMapKeyRef:
+                      name: app-config
+                      key: MILVUS_HOST
+                - name: MILVUS_PORT
+                  valueFrom:
+                    configMapKeyRef:
+                      name: app-config
+                      key: MILVUS_PORT
+                - name: S3_BUCKET
+                  valueFrom:
+                    secretKeyRef:
+                      name: milvus-backup-secrets
+                      key: S3_BUCKET
+                - name: S3_PREFIX
+                  value: "milvus-backups/"
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: milvus-backup-secrets
+                      key: AWS_ACCESS_KEY_ID
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: milvus-backup-secrets
+                      key: AWS_SECRET_ACCESS_KEY
+                - name: AWS_REGION
+                  valueFrom:
+                    secretKeyRef:
+                      name: milvus-backup-secrets
+                      key: AWS_REGION
+              volumeMounts:
+                - name: scripts
+                  mountPath: /scripts
+                  readOnly: true
+          volumes:
+            - name: scripts
+              configMap:
+                name: milvus-backup-scripts
+                defaultMode: 0555
