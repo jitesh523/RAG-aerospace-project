@@ -39,6 +39,15 @@ ASK_RETRIES = Counter(
     "ask_retries_total",
     "Total retries performed for LLM invocations in /ask",
 )
+ASK_TIMEOUTS = Counter(
+    "ask_timeouts_total",
+    "Total LLM timeouts in /ask",
+)
+CIRCUIT_OPEN = Counter(
+    "circuit_open_total",
+    "Number of times a circuit was opened",
+    labelnames=["component"],
+)
 ASK_USAGE_TOTAL = Counter(
     "ask_usage_total",
     "Total /ask requests counted towards quota",
@@ -71,6 +80,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from starlette.responses import StreamingResponse, PlainTextResponse
 from prometheus_client import Counter
+import concurrent.futures
 
 app = FastAPI(
     title="Aerospace RAG API",
@@ -180,6 +190,8 @@ class ReadyResp(BaseModel):
 qa_chain = None
 READY = False
 _rerank_model = None
+_cb_failures = 0
+_cb_open_until = 0
 
 # Structured logging setup
 logger = logging.getLogger("api")
@@ -391,7 +403,12 @@ def ask(req: AskReq, request: Request):
             if ent and (time.time() - ent["t"]) < Config.CACHE_TTL_SECONDS:
                 return ent["v"]
 
-    # LLM invocation with retry/backoff
+    # Circuit breaker: short-circuit if open
+    now_ts = int(time.time())
+    if _cb_open_until and now_ts < _cb_open_until:
+        raise HTTPException(status_code=503, detail="LLM unavailable (circuit open)")
+
+    # LLM invocation with retry/backoff + timeout
     attempt = 0
     delay = max(0.001, Config.RETRY_BASE_DELAY_MS / 1000.0)
     result = None
@@ -401,17 +418,40 @@ def ask(req: AskReq, request: Request):
                 cur = ot_trace.get_current_span()
                 cur.set_attribute("query.length", len(q))
                 cur.set_attribute("retriever.backend", os.getenv("RETRIEVER_BACKEND", Config.RETRIEVER_BACKEND))
-            result = qa_chain.invoke(q)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(qa_chain.invoke, q)
+                try:
+                    result = fut.result(timeout=max(1, Config.LLM_TIMEOUT_SECONDS))
+                except concurrent.futures.TimeoutError:
+                    ASK_TIMEOUTS.inc()
+                    # record failure for CB
+                    global _cb_failures, _cb_open_until
+                    _cb_failures += 1
+                    if _cb_failures >= Config.CB_FAIL_THRESHOLD:
+                        _cb_open_until = int(time.time()) + max(1, Config.CB_RESET_SECONDS)
+                        CIRCUIT_OPEN.labels(component="llm").inc()
+                    raise HTTPException(status_code=504, detail="LLM timeout")
             break
+        except HTTPException:
+            # propagate HTTP errors like timeout
+            raise
         except Exception:
             attempt += 1
             if attempt >= max(1, Config.RETRY_MAX_ATTEMPTS):
                 if span_ctx is not None:
                     span_ctx.__exit__(None, None, None)
+                # record failure for CB
+                _cb_failures += 1
+                if _cb_failures >= Config.CB_FAIL_THRESHOLD:
+                    _cb_open_until = int(time.time()) + max(1, Config.CB_RESET_SECONDS)
+                    CIRCUIT_OPEN.labels(component="llm").inc()
                 raise
             ASK_RETRIES.inc()
             time.sleep(delay)
             delay *= 2
+    # CB success path: reset failures when success
+    _cb_failures = 0
+    _cb_open_until = 0
     if span_ctx is not None:
         span_ctx.__exit__(None, None, None)
     docs = result["source_documents"]
@@ -518,7 +558,19 @@ def ask_stream(query: str, request: Request):
     def _gen():
         # compute once, then stream in chunks
         try:
-            result = qa_chain.invoke(q)
+            # respect circuit breaker and timeout logic by reusing same flow as /ask
+            # (no retries for stream; we apply single timeout)
+            if _cb_open_until and int(time.time()) < _cb_open_until:
+                yield f"event: error\ndata: {json.dumps({'error': 'LLM unavailable (circuit open)'})}\n\n"
+                return
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(qa_chain.invoke, q)
+                try:
+                    result = fut.result(timeout=max(1, Config.LLM_TIMEOUT_SECONDS))
+                except concurrent.futures.TimeoutError:
+                    ASK_TIMEOUTS.inc()
+                    yield f"event: error\ndata: {json.dumps({'error': 'LLM timeout'})}\n\n"
+                    return
             full = result.get("result", "")
             docs = result.get("source_documents", [])
             # first send sources metadata

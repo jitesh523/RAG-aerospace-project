@@ -73,3 +73,7 @@ class Config:
     # Quotas
     QUOTA_ENABLED = os.getenv("QUOTA_ENABLED", "false").lower() == "true"
     QUOTA_DAILY_LIMIT = int(os.getenv("QUOTA_DAILY_LIMIT", "1000"))
+    # LLM timeouts & circuit breaker
+    LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", "20"))
+    CB_FAIL_THRESHOLD = int(os.getenv("CB_FAIL_THRESHOLD", "3"))
+    CB_RESET_SECONDS = int(os.getenv("CB_RESET_SECONDS", "60"))
