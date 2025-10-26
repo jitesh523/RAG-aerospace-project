@@ -126,6 +126,19 @@ curl -N "http://localhost:8000/ask/stream?query=Explain%20stall%20margin" \
 ```
 Events include an initial `sources` event followed by `data` chunks and a final `done` event.
 
+### Ask API with Filters
+
+You can constrain sources using include-only filters:
+
+```bash
+curl -s http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "Explain stall margin",
+    "filters": { "sources": ["aero_handbook.pdf", "turbine.pdf"] }
+  }'
+```
+
 ## 🛠️ Development
 
 ### Project Structure
@@ -331,14 +344,61 @@ Key runtime settings:
 - `RETRY_MAX_ATTEMPTS`, `RETRY_BASE_DELAY_MS`: exponential backoff settings for vector search and ingestion.
 - `CORS_ALLOWED_ORIGINS`, `CORS_ALLOW_CREDENTIALS`, `CORS_ALLOWED_METHODS`, `CORS_ALLOWED_HEADERS`: CORS configuration.
 - `RERANK_ENABLED`: when `true`, applies a lightweight query-term based rerank to sources.
+- `RERANK_MODEL`: optional ML reranker model (SentenceTransformers), falls back to TF when unset.
 - `HYBRID_ENABLED`, `HYBRID_ALPHA`: enable hybrid retrieval (vector + term frequency) and control blend weight (0..1).
- - `STREAMING_ENABLED`, `GZIP_ENABLED`, `MAX_REQUEST_BYTES`: enable SSE endpoint, toggle gzip, and enforce request size limits.
- - `CONTENT_SECURITY_POLICY`: optional CSP header value.
+- `STREAMING_ENABLED`, `GZIP_ENABLED`, `MAX_REQUEST_BYTES`: enable SSE endpoint, toggle gzip, and enforce request size limits.
+- `CONTENT_SECURITY_POLICY`: optional CSP header value.
+- `QUOTA_ENABLED`, `QUOTA_DAILY_LIMIT`: enable per-API-key daily quotas; see `/usage`.
+- `LLM_TIMEOUT_SECONDS`, `CB_FAIL_THRESHOLD`, `CB_RESET_SECONDS`: timeout and simple circuit breaker for LLM calls.
 
 ### Key Settings
 - `EMBED_MODEL`: Choose embedding model (OpenAI vs HuggingFace)
 - `MILVUS_COLLECTION`: Collection name for document vectors
 - `PORT`: API server port
+
+## 📈 Usage and Quotas
+
+When `QUOTA_ENABLED=true`, `/ask` increments a per-API-key daily counter. Check quota with:
+
+```bash
+curl -s http://localhost:8000/usage -H "x-api-key: $API_KEY"
+```
+Response:
+
+```json
+{"limit": 1000, "used_today": 42}
+```
+
+Grafana panel: sum by tenant of `ask_usage_total`.
+
+## 🚀 Autoscaling (KEDA)
+
+KEDA ScaledObject manifest at `k8s/manifests/keda-scaledobject.yaml` provides CPU and optional Prometheus QPS triggers. Adjust thresholds and replica bounds as needed.
+
+## 💾 DR: Milvus Backup/Restore
+
+- Backup CronJob: `k8s/manifests/milvus-backup-cronjob.yaml`
+- Scripts ConfigMap: `k8s/manifests/milvus-backup-script-configmap.yaml`
+- Restore validation Job: `k8s/manifests/milvus-restore-job.yaml`
+
+Supply S3 credentials in Secret `milvus-backup-secrets` and Milvus host/port via `app-config` ConfigMap.
+
+## 🧪 Eval Harness
+
+Run simple retrieval/answer eval locally or via HTTP:
+
+```bash
+python tests/eval/run_eval.py
+
+# Against a running API
+EVAL_BASE_URL=http://localhost:8000 API_KEY=... python tests/eval/run_eval.py
+```
+Outputs JSON with averages and per-query details. Configure with `EVAL_K` and `GOLDEN_PATH`.
+
+## 📊 Grafana Panels
+
+- Quota usage: `sum by (tenant) (ask_usage_total)`
+- Embedding metrics: `embed_batches_total`, `embed_items_total`, `embed_batch_duration_seconds` (p95 panel example included)
 
 ## 🤝 Contributing
 
