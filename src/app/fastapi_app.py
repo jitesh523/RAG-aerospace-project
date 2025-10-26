@@ -152,8 +152,12 @@ else:
         require_auth(request)
         return handle_metrics(request)
 
+class AskFilters(BaseModel):
+    sources: Optional[list[str]] = None
+
 class AskReq(BaseModel):
     query: str
+    filters: Optional[AskFilters] = None
 
 class SourceItem(BaseModel):
     source: str
@@ -175,6 +179,7 @@ class ReadyResp(BaseModel):
 
 qa_chain = None
 READY = False
+_rerank_model = None
 
 # Structured logging setup
 logger = logging.getLogger("api")
@@ -410,7 +415,36 @@ def ask(req: AskReq, request: Request):
     if span_ctx is not None:
         span_ctx.__exit__(None, None, None)
     docs = result["source_documents"]
-    if Config.RERANK_ENABLED:
+    # Apply simple metadata filters (include-only by source)
+    if req.filters and req.filters.sources:
+        try:
+            allowed = set(req.filters.sources)
+            docs = [d for d in docs if d.metadata.get("source") in allowed]
+        except Exception:
+            pass
+    # Reranking: ML model if configured, else TF-based if enabled
+    if Config.RERANK_MODEL:
+        global _rerank_model
+        try:
+            if _rerank_model is None:
+                from sentence_transformers import SentenceTransformer
+                _rerank_model = SentenceTransformer(Config.RERANK_MODEL)
+            # encode query and docs, rank by cosine similarity
+            texts = [getattr(d, "page_content", "") for d in docs]
+            if texts:
+                from numpy import dot
+                from numpy.linalg import norm
+                import numpy as np
+                qv = _rerank_model.encode([q], normalize_embeddings=True)[0]
+                dvs = _rerank_model.encode(texts, normalize_embeddings=True)
+                scores = [float(dot(qv, dv)) for dv in dvs]
+                pairs = list(zip(scores, docs))
+                pairs.sort(key=lambda x: x[0], reverse=True)
+                docs = [d for _, d in pairs]
+        except Exception:
+            # fall back silently
+            pass
+    elif Config.RERANK_ENABLED:
         q_terms = [t for t in q.lower().split() if t]
         def _score(doc):
             text = getattr(doc, "page_content", "").lower()
@@ -418,7 +452,7 @@ def ask(req: AskReq, request: Request):
         try:
             docs = sorted(docs, key=_score, reverse=True)
         except Exception:
-            docs = result["source_documents"]
+            pass
     sources = [
         {
             "source": d.metadata.get("source", ""),
