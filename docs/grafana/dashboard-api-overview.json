@@ -64,6 +64,34 @@
       "targets": [
         {"expr": "sum by (stage) (ingest_retries_total)"}
       ]
+    },
+    {
+      "type": "graph",
+      "title": "Quota Usage by Tenant",
+      "targets": [
+        {"expr": "sum by (tenant) (ask_usage_total)"}
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Embedding Batches (count)",
+      "targets": [
+        {"expr": "sum(embed_batches_total)"}
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Embedding Items (count)",
+      "targets": [
+        {"expr": "sum(embed_items_total)"}
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Embed Batch Duration p95 (s)",
+      "targets": [
+        {"expr": "histogram_quantile(0.95, sum(rate(embed_batch_duration_seconds_bucket[5m])) by (le))"}
+      ]
     }
   ],
   "templating": {"list": []},
