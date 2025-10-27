@@ -48,6 +48,11 @@ CIRCUIT_OPEN = Counter(
     "Number of times a circuit was opened",
     labelnames=["component"],
 )
+CIRCUIT_STATE = Gauge(
+    "circuit_state",
+    "Current circuit state (0=closed,1=open)",
+    labelnames=["component"],
+)
 ASK_USAGE_TOTAL = Counter(
     "ask_usage_total",
     "Total /ask requests counted towards quota",
@@ -79,7 +84,7 @@ from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from starlette.responses import StreamingResponse, PlainTextResponse
-from prometheus_client import Counter
+from prometheus_client import Counter, Gauge
 import concurrent.futures
 
 app = FastAPI(
@@ -409,6 +414,7 @@ def ask(req: AskReq, request: Request):
     # Circuit breaker: short-circuit if open
     now_ts = int(time.time())
     if _cb_open_until and now_ts < _cb_open_until:
+        CIRCUIT_STATE.labels(component="llm").set(1)
         raise HTTPException(status_code=503, detail="LLM unavailable (circuit open)")
 
     # LLM invocation with retry/backoff + timeout
@@ -433,6 +439,7 @@ def ask(req: AskReq, request: Request):
                     if _cb_failures >= Config.CB_FAIL_THRESHOLD:
                         _cb_open_until = int(time.time()) + max(1, Config.CB_RESET_SECONDS)
                         CIRCUIT_OPEN.labels(component="llm").inc()
+                        CIRCUIT_STATE.labels(component="llm").set(1)
                     raise HTTPException(status_code=504, detail="LLM timeout")
             break
         except HTTPException:
@@ -448,6 +455,7 @@ def ask(req: AskReq, request: Request):
                 if _cb_failures >= Config.CB_FAIL_THRESHOLD:
                     _cb_open_until = int(time.time()) + max(1, Config.CB_RESET_SECONDS)
                     CIRCUIT_OPEN.labels(component="llm").inc()
+                    CIRCUIT_STATE.labels(component="llm").set(1)
                 raise
             ASK_RETRIES.inc()
             time.sleep(delay)
@@ -455,6 +463,7 @@ def ask(req: AskReq, request: Request):
     # CB success path: reset failures when success
     _cb_failures = 0
     _cb_open_until = 0
+    CIRCUIT_STATE.labels(component="llm").set(0)
     if span_ctx is not None:
         span_ctx.__exit__(None, None, None)
     docs = result["source_documents"]
@@ -619,6 +628,26 @@ def ask_stream(query: str, request: Request):
             yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
 
     return StreamingResponse(_gen(), media_type="text/event-stream")
+
+@app.get("/system", tags=["System"], summary="System state")
+def system_state():
+    now_ts = int(time.time())
+    open_state = 1 if (_cb_open_until and now_ts < _cb_open_until) else 0
+    try:
+        CIRCUIT_STATE.labels(component="llm").set(open_state)
+    except Exception:
+        pass
+    return {
+        "circuit": {
+            "component": "llm",
+            "open": bool(open_state),
+            "open_until": _cb_open_until,
+            "failures": _cb_failures,
+            "threshold": Config.CB_FAIL_THRESHOLD,
+            "reset_seconds": Config.CB_RESET_SECONDS,
+        },
+        "ready": READY,
+    }
 
 @app.get("/health", response_model=HealthResp, tags=["System"], summary="Liveness probe")
 def health():
