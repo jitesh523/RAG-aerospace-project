@@ -164,6 +164,9 @@ else:
 
 class AskFilters(BaseModel):
     sources: Optional[list[str]] = None
+    doc_type: Optional[str] = None
+    date_from: Optional[str] = None  # ISO date YYYY-MM-DD
+    date_to: Optional[str] = None    # ISO date YYYY-MM-DD
 
 class AskReq(BaseModel):
     query: str
@@ -455,11 +458,32 @@ def ask(req: AskReq, request: Request):
     if span_ctx is not None:
         span_ctx.__exit__(None, None, None)
     docs = result["source_documents"]
-    # Apply simple metadata filters (include-only by source)
-    if req.filters and req.filters.sources:
+    # Apply simple metadata filters
+    if req.filters:
         try:
-            allowed = set(req.filters.sources)
-            docs = [d for d in docs if d.metadata.get("source") in allowed]
+            if req.filters.sources:
+                allowed = set(req.filters.sources)
+                docs = [d for d in docs if d.metadata.get("source") in allowed]
+            if req.filters.doc_type:
+                dt = req.filters.doc_type
+                docs = [d for d in docs if str(d.metadata.get("doc_type", "")) == dt]
+            if req.filters.date_from or req.filters.date_to:
+                from datetime import datetime
+                df = datetime.fromisoformat(req.filters.date_from) if req.filters.date_from else None
+                dt_ = datetime.fromisoformat(req.filters.date_to) if req.filters.date_to else None
+                def _in_range(meta_date: str) -> bool:
+                    try:
+                        if not meta_date:
+                            return False
+                        d = datetime.fromisoformat(str(meta_date)[:10])
+                        if df and d < df:
+                            return False
+                        if dt_ and d > dt_:
+                            return False
+                        return True
+                    except Exception:
+                        return False
+                docs = [d for d in docs if _in_range(str(d.metadata.get("date", "")))]
         except Exception:
             pass
     # Reranking: ML model if configured, else TF-based if enabled
