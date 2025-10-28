@@ -412,6 +412,30 @@ Outputs JSON with averages and per-query details. Configure with `EVAL_K` and `G
 
 - Quota usage: `sum by (tenant) (ask_usage_total)`
 - Embedding metrics: `embed_batches_total`, `embed_items_total`, `embed_batch_duration_seconds` (p95 panel example included)
+- Circuit breaker: `circuit_state{component="llm"}` (0=closed, 1=open)
+
+## 🔍 System Endpoint
+
+Query breaker and readiness state:
+
+```bash
+curl -s http://localhost:8000/system | jq
+```
+Response:
+
+```json
+{
+  "circuit": {
+    "component": "llm",
+    "open": false,
+    "open_until": 0,
+    "failures": 0,
+    "threshold": 3,
+    "reset_seconds": 60
+  },
+  "ready": true
+}
+```
 
 ## 🤝 Contributing
 
