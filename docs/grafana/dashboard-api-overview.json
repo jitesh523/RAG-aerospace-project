@@ -92,6 +92,13 @@
       "targets": [
         {"expr": "histogram_quantile(0.95, sum(rate(embed_batch_duration_seconds_bucket[5m])) by (le))"}
       ]
+    },
+    {
+      "type": "stat",
+      "title": "Circuit State (LLM)",
+      "targets": [
+        {"expr": "max(circuit_state{component='llm'})"}
+      ]
     }
   ],
   "templating": {"list": []},

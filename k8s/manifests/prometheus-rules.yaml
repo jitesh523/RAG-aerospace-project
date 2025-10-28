@@ -81,3 +81,12 @@ spec:
           annotations:
             summary: "Slow burn: 5xx > 5% (1h)"
             description: "Sustained elevated 5xx rate over 1h."
+
+        - alert: RAGLLMCircuitOpen
+          expr: max(circuit_state{component="llm"}) == 1
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "LLM circuit breaker is OPEN"
+            description: "Circuit breaker for LLM calls is open, indicating repeated timeouts/failures."
