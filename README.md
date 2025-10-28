@@ -116,6 +116,19 @@ const res = await client.ask("What is thrust-to-weight ratio?");
 console.log(res);
 ```
 
+#### JS SDK Publish
+
+The workflow `.github/workflows/npm-publish.yml` publishes `@rag-aerospace/client` when a tag matching `js-v*` is pushed.
+
+1. Set `NPM_TOKEN` repository secret with publish rights.
+2. Update `clients/js/package.json` version.
+3. Create a tag and push:
+
+```bash
+git tag js-v0.1.0
+git push origin js-v0.1.0
+```
+
 ### Streaming (SSE)
 
 When `STREAMING_ENABLED=true`, you can stream answers via Server-Sent Events:
