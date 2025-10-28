@@ -60,9 +60,10 @@ class HybridRetriever:
     blended score: alpha*vector_sim + (1-alpha)*tf_norm.
     """
 
-    def __init__(self, vectorstore, backend_label: str):
+    def __init__(self, vectorstore, backend_label: str, search_kwargs: dict | None = None):
         self._vs = vectorstore
         self._backend_label = backend_label
+        self._search_kwargs = search_kwargs or {}
 
     def _tf_score(self, query: str, doc_text: str) -> float:
         q_terms = [t for t in (query or "").lower().split() if t]
@@ -79,7 +80,7 @@ class HybridRetriever:
             try:
                 # fetch_k for broader candidate set
                 fetch_k = max(Config.RETRIEVER_FETCH_K, Config.RETRIEVER_K)
-                pairs = self._vs.similarity_search_with_score(query, k=fetch_k)
+                pairs = self._vs.similarity_search_with_score(query, k=fetch_k, **self._search_kwargs)
                 # Extract distances/scores (lower is better) and convert to similarity
                 if not pairs:
                     elapsed = time.time() - start
@@ -120,7 +121,53 @@ class HybridRetriever:
                     VECTOR_SEARCH_DURATION.labels(self._backend_label).observe(elapsed)
                     raise
 
-def build_chain():
+def _milvus_expr_from_filters(filters) -> str | None:
+    if not filters:
+        return None
+    parts = []
+    try:
+        if getattr(filters, "sources", None):
+            arr = ",".join([f'"{s}"' for s in filters.sources])
+            parts.append(f"source in [{arr}]")
+        if getattr(filters, "doc_type", None):
+            parts.append(f'doc_type == "{filters.doc_type}"')
+        if getattr(filters, "date_from", None):
+            parts.append(f'date >= "{filters.date_from}"')
+        if getattr(filters, "date_to", None):
+            parts.append(f'date <= "{filters.date_to}"')
+    except Exception:
+        return None
+    return " and ".join(parts) if parts else None
+
+def _faiss_filter_callable_from_filters(filters):
+    if not filters:
+        return None
+    def _pred(md: dict) -> bool:
+        try:
+            if getattr(filters, "sources", None):
+                if md.get("source") not in set(filters.sources):
+                    return False
+            if getattr(filters, "doc_type", None):
+                if str(md.get("doc_type", "")) != str(filters.doc_type):
+                    return False
+            if getattr(filters, "date_from", None) or getattr(filters, "date_to", None):
+                from datetime import datetime
+                ds = str(md.get("date", ""))[:10]
+                if not ds:
+                    return False
+                d = datetime.fromisoformat(ds)
+                if getattr(filters, "date_from", None):
+                    if d < datetime.fromisoformat(filters.date_from):
+                        return False
+                if getattr(filters, "date_to", None):
+                    if d > datetime.fromisoformat(filters.date_to):
+                        return False
+            return True
+        except Exception:
+            return False
+    return _pred
+
+def build_chain(filters=None):
     if Config.MOCK_MODE:
         class _FakeChain:
             def invoke(self, q):
@@ -143,12 +190,20 @@ def build_chain():
         # Default to FAISS
         vs = FAISS.load_local("./faiss_store", embeddings=embeddings)
 
-    if Config.HYBRID_ENABLED:
-        retriever = HybridRetriever(vs, backend_label=backend)
+    # search kwargs based on filters and backend
+    search_kwargs = {"k": Config.RETRIEVER_K, "fetch_k": Config.RETRIEVER_FETCH_K}
+    if backend == "milvus":
+        expr = _milvus_expr_from_filters(filters)
+        if expr:
+            search_kwargs["expr"] = expr
     else:
-        base_retriever = vs.as_retriever(
-            search_type="mmr",
-            search_kwargs={"k": Config.RETRIEVER_K, "fetch_k": Config.RETRIEVER_FETCH_K},
-        )
+        pred = _faiss_filter_callable_from_filters(filters)
+        if pred:
+            search_kwargs["filter"] = pred
+
+    if Config.HYBRID_ENABLED:
+        retriever = HybridRetriever(vs, backend_label=backend, search_kwargs=search_kwargs)
+    else:
+        base_retriever = vs.as_retriever(search_type="mmr", search_kwargs=search_kwargs)
         retriever = TimedRetriever(base_retriever, backend_label=backend)
     return RetrievalQA.from_chain_type(llm=llm, retriever=retriever, return_source_documents=True)
