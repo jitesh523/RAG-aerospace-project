@@ -2,6 +2,16 @@ def require_auth(request: Request) -> None:
     if not Config.API_KEY:
         return
     api_key = request.headers.get("x-api-key")
+CACHE_HITS_TOTAL = Counter(
+    "cache_hits_total",
+    "/ask cache hits",
+    labelnames=["tenant"],
+)
+CACHE_MISSES_TOTAL = Counter(
+    "cache_misses_total",
+    "/ask cache misses",
+    labelnames=["tenant"],
+)
 DOCS_SOFT_DELETES_TOTAL = Counter(
     "docs_soft_deletes_total",
     "Total soft-deleted sources",
@@ -64,6 +74,21 @@ CIRCUIT_STATE = Gauge(
 ASK_USAGE_TOTAL = Counter(
     "ask_usage_total",
     "Total /ask requests counted towards quota",
+    labelnames=["tenant"],
+)
+TOKENS_PROMPT_TOTAL = Counter(
+    "tokens_prompt_total",
+    "Estimated prompt tokens",
+    labelnames=["tenant"],
+)
+TOKENS_COMPLETION_TOTAL = Counter(
+    "tokens_completion_total",
+    "Estimated completion tokens",
+    labelnames=["tenant"],
+)
+COST_USD_TOTAL = Counter(
+    "cost_usd_total",
+    "Estimated USD cost",
     labelnames=["tenant"],
 )
 from fastapi import FastAPI
@@ -405,20 +430,31 @@ def ask(req: AskReq, request: Request):
         raise HTTPException(status_code=400, detail="Query too long (max 4000 chars)")
     if not READY or qa_chain is None:
         raise HTTPException(status_code=503, detail="Service not ready. Ingest documents to create ./faiss_store and restart.")
-    # Cache get (if enabled)
+    # Cache get (if enabled) keyed by query+filters+tenant
+    tenant_label = _tenant_from_key(api_key_hdr)
     if Config.CACHE_ENABLED:
-        ckey = f"ask:{q}"
+        try:
+            filt = req.filters.dict() if req.filters else {}
+        except Exception:
+            filt = {}
+        ckey = f"ask:{tenant_label}:{q}:{json.dumps(filt, sort_keys=True)}"
         if _redis is not None:
             try:
                 cached = _redis.get(ckey)
                 if cached:
+                    CACHE_HITS_TOTAL.labels(tenant=tenant_label).inc()
                     return json.loads(cached)
+                else:
+                    CACHE_MISSES_TOTAL.labels(tenant=tenant_label).inc()
             except Exception:
                 pass
         else:
             ent = _cache.get(ckey)
             if ent and (time.time() - ent["t"]) < Config.CACHE_TTL_SECONDS:
+                CACHE_HITS_TOTAL.labels(tenant=tenant_label).inc()
                 return ent["v"]
+            else:
+                CACHE_MISSES_TOTAL.labels(tenant=tenant_label).inc()
 
     # Circuit breaker: short-circuit if open
     now_ts = int(time.time())
@@ -558,9 +594,26 @@ def ask(req: AskReq, request: Request):
         for d in docs
     ]
     resp = {"answer": result["result"], "sources": sources}
+    # Cost and token estimation metrics
+    if Config.COST_ENABLED:
+        try:
+            tenant = _tenant_from_key(api_key_hdr)
+            # very rough token estimate: ~4 chars per token
+            p_tokens = max(1, int(len(q) / 4))
+            c_tokens = max(1, int(len(resp.get("answer", "")) / 4))
+            TOKENS_PROMPT_TOTAL.labels(tenant=tenant).inc(p_tokens)
+            TOKENS_COMPLETION_TOTAL.labels(tenant=tenant).inc(c_tokens)
+            cost = (p_tokens / 1000.0) * Config.COST_PER_1K_PROMPT_TOKENS + (c_tokens / 1000.0) * Config.COST_PER_1K_COMPLETION_TOKENS
+            COST_USD_TOTAL.labels(tenant=tenant).inc(cost)
+        except Exception:
+            pass
     # Cache set
     if Config.CACHE_ENABLED:
-        ckey = f"ask:{q}"
+        try:
+            filt = req.filters.dict() if req.filters else {}
+        except Exception:
+            filt = {}
+        ckey = f"ask:{tenant_label}:{q}:{json.dumps(filt, sort_keys=True)}"
         if _redis is not None:
             try:
                 _redis.setex(ckey, Config.CACHE_TTL_SECONDS, json.dumps(resp))
@@ -663,6 +716,18 @@ def ask_stream(query: str, request: Request):
             if chunk:
                 yield f"data: {' '.join(chunk)}\n\n"
             yield "event: done\ndata: [DONE]\n\n"
+            # record estimated tokens/cost at end
+            if Config.COST_ENABLED:
+                try:
+                    tenant = _tenant_from_key(request.headers.get("x-api-key"))
+                    p_tokens = max(1, int(len(q) / 4))
+                    c_tokens = max(1, int(len(full) / 4))
+                    TOKENS_PROMPT_TOTAL.labels(tenant=tenant).inc(p_tokens)
+                    TOKENS_COMPLETION_TOTAL.labels(tenant=tenant).inc(c_tokens)
+                    cost = (p_tokens / 1000.0) * Config.COST_PER_1K_PROMPT_TOKENS + (c_tokens / 1000.0) * Config.COST_PER_1K_COMPLETION_TOKENS
+                    COST_USD_TOTAL.labels(tenant=tenant).inc(cost)
+                except Exception:
+                    pass
         except Exception as e:
             yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
 
