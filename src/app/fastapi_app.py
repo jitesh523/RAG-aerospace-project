@@ -1,3 +1,24 @@
+def _get_cache_ns() -> int:
+    if _redis is not None:
+        try:
+            v = _redis.get("cache:ns")
+            if v:
+                return int(v)
+            _redis.set("cache:ns", 1)
+            return 1
+        except Exception:
+            pass
+    return _cache_ns_mem
+
+def _bump_cache_ns() -> int:
+    global _cache_ns_mem
+    if _redis is not None:
+        try:
+            return int(_redis.incr("cache:ns"))
+        except Exception:
+            pass
+    _cache_ns_mem += 1
+    return _cache_ns_mem
 def require_auth(request: Request) -> None:
     if not Config.API_KEY:
         return
@@ -244,6 +265,7 @@ if not logger.handlers:
 # Rate limiter: Redis (if configured) with fallback to in-memory
 _rate_state = {}
 _deny_sources_mem = set()
+_cache_ns_mem = 1
 _redis = None
 if Config.REDIS_URL:
     try:
@@ -432,12 +454,13 @@ def ask(req: AskReq, request: Request):
         raise HTTPException(status_code=503, detail="Service not ready. Ingest documents to create ./faiss_store and restart.")
     # Cache get (if enabled) keyed by query+filters+tenant
     tenant_label = _tenant_from_key(api_key_hdr)
+    ns = _get_cache_ns()
     if Config.CACHE_ENABLED:
         try:
             filt = req.filters.dict() if req.filters else {}
         except Exception:
             filt = {}
-        ckey = f"ask:{tenant_label}:{q}:{json.dumps(filt, sort_keys=True)}"
+        ckey = f"ask:{ns}:{tenant_label}:{q}:{json.dumps(filt, sort_keys=True)}"
         if _redis is not None:
             try:
                 cached = _redis.get(ckey)
@@ -613,7 +636,8 @@ def ask(req: AskReq, request: Request):
             filt = req.filters.dict() if req.filters else {}
         except Exception:
             filt = {}
-        ckey = f"ask:{tenant_label}:{q}:{json.dumps(filt, sort_keys=True)}"
+        ns = _get_cache_ns()
+        ckey = f"ask:{ns}:{tenant_label}:{q}:{json.dumps(filt, sort_keys=True)}"
         if _redis is not None:
             try:
                 _redis.setex(ckey, Config.CACHE_TTL_SECONDS, json.dumps(resp))
@@ -751,6 +775,7 @@ def admin_delete(req: AdminSoftDeleteReq, request: Request):
     if not ok or _redis is None:
         _deny_sources_mem.add(src)
     DOCS_SOFT_DELETES_TOTAL.inc()
+    _bump_cache_ns()
     return {"status": "ok", "source": src}
 
 @app.post("/admin/docs/undelete", tags=["Admin"], summary="Remove a source from denylist")
@@ -771,6 +796,7 @@ def admin_undelete(req: AdminSoftDeleteReq, request: Request):
         except Exception:
             pass
     DOCS_SOFT_UNDELETES_TOTAL.inc()
+    _bump_cache_ns()
     return {"status": "ok", "source": src}
 
 @app.get("/system", tags=["System"], summary="System state")
