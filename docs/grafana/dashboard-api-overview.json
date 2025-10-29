@@ -99,6 +99,14 @@
       "targets": [
         {"expr": "max(circuit_state{component='llm'})"}
       ]
+    },
+    {
+      "type": "graph",
+      "title": "Cache Hit Ratio by Tenant",
+      "targets": [
+        {"expr": "sum(rate(cache_hits_total[5m])) by (tenant) / (sum(rate(cache_hits_total[5m])) by (tenant) + sum(rate(cache_misses_total[5m])) by (tenant))"}
+      ],
+      "yaxes": [{"format": "percent"}, {"format": "short"}]
     }
   ],
   "templating": {"list": []},
