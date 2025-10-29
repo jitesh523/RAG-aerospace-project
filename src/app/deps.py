@@ -135,6 +135,9 @@ def _milvus_expr_from_filters(filters) -> str | None:
             parts.append(f'date >= "{filters.date_from}"')
         if getattr(filters, "date_to", None):
             parts.append(f'date <= "{filters.date_to}"')
+        if Config.MULTITENANT_ENABLED and getattr(filters, "tenant", None):
+            field = Config.TENANT_METADATA_FIELD
+            parts.append(f'{field} == "{filters.tenant}"')
     except Exception:
         return None
     return " and ".join(parts) if parts else None
@@ -162,6 +165,10 @@ def _faiss_filter_callable_from_filters(filters):
                 if getattr(filters, "date_to", None):
                     if d > datetime.fromisoformat(filters.date_to):
                         return False
+            if Config.MULTITENANT_ENABLED and getattr(filters, "tenant", None):
+                field = Config.TENANT_METADATA_FIELD
+                if str(md.get(field, "")) != str(filters.tenant):
+                    return False
             return True
         except Exception:
             return False

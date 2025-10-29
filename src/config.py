@@ -77,3 +77,6 @@ class Config:
     LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", "20"))
     CB_FAIL_THRESHOLD = int(os.getenv("CB_FAIL_THRESHOLD", "3"))
     CB_RESET_SECONDS = int(os.getenv("CB_RESET_SECONDS", "60"))
+    # Multi-tenancy
+    MULTITENANT_ENABLED = os.getenv("MULTITENANT_ENABLED", "false").lower() == "true"
+    TENANT_METADATA_FIELD = os.getenv("TENANT_METADATA_FIELD", "tenant")
