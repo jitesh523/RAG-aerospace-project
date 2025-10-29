@@ -2,6 +2,14 @@ def require_auth(request: Request) -> None:
     if not Config.API_KEY:
         return
     api_key = request.headers.get("x-api-key")
+DOCS_SOFT_DELETES_TOTAL = Counter(
+    "docs_soft_deletes_total",
+    "Total soft-deleted sources",
+)
+DOCS_SOFT_UNDELETES_TOTAL = Counter(
+    "docs_soft_undeletes_total",
+    "Total undeleted sources",
+)
     if api_key == Config.API_KEY:
         return
     authz = request.headers.get("authorization", "")
@@ -210,6 +218,7 @@ if not logger.handlers:
 
 # Rate limiter: Redis (if configured) with fallback to in-memory
 _rate_state = {}
+_deny_sources_mem = set()
 _redis = None
 if Config.REDIS_URL:
     try:
@@ -467,6 +476,21 @@ def ask(req: AskReq, request: Request):
     if span_ctx is not None:
         span_ctx.__exit__(None, None, None)
     docs = result["source_documents"]
+    # Exclude soft-deleted sources (denylist)
+    try:
+        deny = set()
+        if _redis is not None:
+            try:
+                members = _redis.smembers("deny:sources")
+                deny = set([m.decode("utf-8") if isinstance(m, (bytes, bytearray)) else str(m) for m in members])
+            except Exception:
+                deny = set(_deny_sources_mem)
+        else:
+            deny = set(_deny_sources_mem)
+        if deny:
+            docs = [d for d in docs if d.metadata.get("source") not in deny]
+    except Exception:
+        pass
     # Apply simple metadata filters
     if req.filters:
         try:
@@ -606,6 +630,21 @@ def ask_stream(query: str, request: Request):
                     return
             full = result.get("result", "")
             docs = result.get("source_documents", [])
+            # Exclude soft-deleted sources (denylist)
+            try:
+                deny = set()
+                if _redis is not None:
+                    try:
+                        members = _redis.smembers("deny:sources")
+                        deny = set([m.decode("utf-8") if isinstance(m, (bytes, bytearray)) else str(m) for m in members])
+                    except Exception:
+                        deny = set(_deny_sources_mem)
+                else:
+                    deny = set(_deny_sources_mem)
+                if deny:
+                    docs = [d for d in docs if d.metadata.get("source") not in deny]
+            except Exception:
+                pass
             # first send sources metadata
             srcs = []
             for d in docs:
@@ -628,6 +667,46 @@ def ask_stream(query: str, request: Request):
             yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
 
     return StreamingResponse(_gen(), media_type="text/event-stream")
+
+class AdminSoftDeleteReq(BaseModel):
+    source: str
+
+@app.post("/admin/docs/delete", tags=["Admin"], summary="Soft-delete a source (denylist)")
+def admin_delete(req: AdminSoftDeleteReq, request: Request):
+    require_auth(request)
+    src = (req.source or "").strip()
+    if not src:
+        raise HTTPException(status_code=400, detail="source is required")
+    ok = True
+    if _redis is not None:
+        try:
+            _redis.sadd("deny:sources", src)
+        except Exception:
+            ok = False
+    if not ok or _redis is None:
+        _deny_sources_mem.add(src)
+    DOCS_SOFT_DELETES_TOTAL.inc()
+    return {"status": "ok", "source": src}
+
+@app.post("/admin/docs/undelete", tags=["Admin"], summary="Remove a source from denylist")
+def admin_undelete(req: AdminSoftDeleteReq, request: Request):
+    require_auth(request)
+    src = (req.source or "").strip()
+    if not src:
+        raise HTTPException(status_code=400, detail="source is required")
+    ok = True
+    if _redis is not None:
+        try:
+            _redis.srem("deny:sources", src)
+        except Exception:
+            ok = False
+    if not ok or _redis is None:
+        try:
+            _deny_sources_mem.discard(src)
+        except Exception:
+            pass
+    DOCS_SOFT_UNDELETES_TOTAL.inc()
+    return {"status": "ok", "source": src}
 
 @app.get("/system", tags=["System"], summary="System state")
 def system_state():
