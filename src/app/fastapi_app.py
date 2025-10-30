@@ -70,6 +70,38 @@ DOCS_SOFT_UNDELETES_TOTAL = Counter(
         return
     raise HTTPException(status_code=401, detail="Invalid or missing API key/JWT")
 
+def require_admin(request: Request) -> None:
+    """Require caller to be admin.
+
+    - API key auth: treated as admin
+    - JWT auth: must include 'admin' in scope/scopes/scp or in roles claim
+    """
+    require_auth(request)
+    # If API key is used, allow
+    api_key = request.headers.get("x-api-key")
+    if Config.API_KEY and api_key == Config.API_KEY:
+        return
+    # If JWT used, verify admin scope
+    authz = request.headers.get("authorization", "")
+    if authz.lower().startswith("bearer "):
+        token = authz.split(" ", 1)[1]
+        try:
+            # We only read claims; signature verification already enforced by require_auth
+            claims = jwt.decode(token, options={"verify_signature": False}, algorithms=["RS256", "HS256"])
+        except Exception:
+            raise HTTPException(status_code=403, detail="Invalid token claims")
+        scopes = claims.get("scope") or claims.get("scopes") or claims.get("scp") or []
+        if isinstance(scopes, str):
+            scopes = scopes.split()
+        roles = claims.get("roles") or []
+        if isinstance(roles, str):
+            roles = [roles]
+        if ("admin" in scopes) or ("admin" in roles):
+            return
+        raise HTTPException(status_code=403, detail="Admin scope required")
+    # Fallback deny
+    raise HTTPException(status_code=403, detail="Admin scope required")
+
 def _tenant_from_key(api_key: str | None) -> str:
     if not api_key:
         return "anon"
@@ -834,7 +866,7 @@ class AdminSoftDeleteReq(BaseModel):
 
 @app.post("/admin/docs/delete", tags=["Admin"], summary="Soft-delete a source (denylist)")
 def admin_delete(req: AdminSoftDeleteReq, request: Request):
-    require_auth(request)
+    require_admin(request)
     src = (req.source or "").strip()
     if not src:
         raise HTTPException(status_code=400, detail="source is required")
@@ -852,7 +884,7 @@ def admin_delete(req: AdminSoftDeleteReq, request: Request):
 
 @app.post("/admin/docs/undelete", tags=["Admin"], summary="Remove a source from denylist")
 def admin_undelete(req: AdminSoftDeleteReq, request: Request):
-    require_auth(request)
+    require_admin(request)
     src = (req.source or "").strip()
     if not src:
         raise HTTPException(status_code=400, detail="source is required")
@@ -883,7 +915,7 @@ DOCS_RETENTION_SOFT_DELETES_TOTAL = Counter(
 
 @app.post("/admin/retention/sweep", tags=["Admin"], summary="Apply retention window to soft-delete old sources")
 def retention_sweep(request: Request):
-    require_auth(request)
+    require_admin(request)
     days = max(0, int(Config.DOC_RETENTION_DAYS))
     if days <= 0:
         return {"status": "skipped", "reason": "DOC_RETENTION_DAYS=0"}
