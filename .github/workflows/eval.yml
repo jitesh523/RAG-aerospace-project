@@ -38,6 +38,30 @@ jobs:
         run: |
           python tests/eval/run_eval.py | tee eval-result.json
 
+      - name: Guardrail - check eval threshold
+        env:
+          EVAL_MIN_RECALL: ${{ vars.EVAL_MIN_RECALL }}
+        run: |
+          python - << 'PY'
+          import json, os, sys
+          thr = os.getenv('EVAL_MIN_RECALL')
+          if not thr:
+              print('EVAL_MIN_RECALL not set; skipping guardrail')
+              sys.exit(0)
+          thr = float(thr)
+          with open('eval-result.json','r') as f:
+              data = json.load(f)
+          # support both keys if present
+          avg = data.get('avg_recall@k') or data.get('avg_recall')
+          if avg is None:
+              print('avg_recall not found in eval-result.json; skipping')
+              sys.exit(0)
+          print(f'avg_recall={avg}, threshold={thr}')
+          if float(avg) < thr:
+              print('Eval failed: recall below threshold')
+              sys.exit(1)
+          PY
+
       - name: Upload eval artifact
         uses: actions/upload-artifact@v4
         with:
