@@ -80,3 +80,12 @@ class Config:
     # Multi-tenancy
     MULTITENANT_ENABLED = os.getenv("MULTITENANT_ENABLED", "false").lower() == "true"
     TENANT_METADATA_FIELD = os.getenv("TENANT_METADATA_FIELD", "tenant")
+    # Cost visibility (approximate)
+    COST_ENABLED = os.getenv("COST_ENABLED", "true").lower() == "true"
+    COST_PER_1K_PROMPT_TOKENS = float(os.getenv("COST_PER_1K_PROMPT_TOKENS", "0.005"))
+    COST_PER_1K_COMPLETION_TOKENS = float(os.getenv("COST_PER_1K_COMPLETION_TOKENS", "0.015"))
+    # Negative caching
+    NEGATIVE_CACHE_ENABLED = os.getenv("NEGATIVE_CACHE_ENABLED", "true").lower() == "true"
+    NEGATIVE_CACHE_TTL_SECONDS = int(os.getenv("NEGATIVE_CACHE_TTL_SECONDS", "15"))
+    # Retention window (days). 0 disables retention sweeps.
+    DOC_RETENTION_DAYS = int(os.getenv("DOC_RETENTION_DAYS", "0"))

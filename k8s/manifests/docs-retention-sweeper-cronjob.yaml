@@ -1,0 +1,33 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: docs-retention-sweeper
+spec:
+  schedule: "0 3 * * *" # daily at 03:00
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: sweeper
+              image: curlimages/curl:8.9.1
+              args:
+                - /bin/sh
+                - -c
+                - |
+                  set -e
+                  : "${API_BASE?must set API_BASE}"
+                  echo "Sweeping retention at ${API_BASE}"
+                  curl -sf -X POST "${API_BASE}/admin/retention/sweep" -H "x-api-key: ${API_KEY}" -H "content-type: application/json" -d '{}'
+              env:
+                - name: API_BASE
+                  valueFrom:
+                    configMapKeyRef:
+                      name: rag-config
+                      key: API_BASE
+                - name: API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: rag-secrets
+                      key: API_KEY

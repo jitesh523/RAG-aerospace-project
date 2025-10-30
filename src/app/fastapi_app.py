@@ -8,6 +8,28 @@ def _get_cache_ns() -> int:
             return 1
         except Exception:
             pass
+    # Update source index (for retention) with any observed date
+    try:
+        cutoff_support = []
+        for d in docs:
+            src = str(d.metadata.get("source", "")).strip()
+            ds = str(d.metadata.get("date", ""))[:10]
+            if not src or not ds:
+                continue
+            try:
+                dt = datetime.fromisoformat(ds)
+                score = int(dt.timestamp())
+                if _redis is not None:
+                    try:
+                        _redis.zadd("sources:index", {src: score})
+                    except Exception:
+                        _source_index_mem[src] = score
+                else:
+                    _source_index_mem[src] = score
+            except Exception:
+                continue
+    except Exception:
+        pass
     return _cache_ns_mem
 
 def _bump_cache_ns() -> int:
@@ -112,6 +134,11 @@ COST_USD_TOTAL = Counter(
     "Estimated USD cost",
     labelnames=["tenant"],
 )
+NEG_CACHE_HITS_TOTAL = Counter(
+    "cache_negative_hits_total",
+    "/ask negative cache hits",
+    labelnames=["tenant"],
+)
 from fastapi import FastAPI
 from pydantic import BaseModel
 from starlette_exporter import PrometheusMiddleware, handle_metrics
@@ -122,6 +149,7 @@ from src.config import Config
 from src.index.milvus_index import check_milvus_readiness
 import time
 import uuid
+from datetime import datetime, timedelta
 import logging
 import json
 import jwt
@@ -266,6 +294,8 @@ if not logger.handlers:
 _rate_state = {}
 _deny_sources_mem = set()
 _cache_ns_mem = 1
+_cache_neg = {}
+_source_index_mem = {}
 _redis = None
 if Config.REDIS_URL:
     try:
@@ -461,8 +491,14 @@ def ask(req: AskReq, request: Request):
         except Exception:
             filt = {}
         ckey = f"ask:{ns}:{tenant_label}:{q}:{json.dumps(filt, sort_keys=True)}"
+        nkey = f"{ckey}:neg"
         if _redis is not None:
             try:
+                # negative first
+                if Config.NEGATIVE_CACHE_ENABLED:
+                    if _redis.get(nkey):
+                        NEG_CACHE_HITS_TOTAL.labels(tenant=tenant_label).inc()
+                        return {"answer": "", "sources": []}
                 cached = _redis.get(ckey)
                 if cached:
                     CACHE_HITS_TOTAL.labels(tenant=tenant_label).inc()
@@ -478,6 +514,12 @@ def ask(req: AskReq, request: Request):
                 return ent["v"]
             else:
                 CACHE_MISSES_TOTAL.labels(tenant=tenant_label).inc()
+                # check in-memory negative cache
+                if Config.NEGATIVE_CACHE_ENABLED:
+                    nent = _cache_neg.get(nkey)
+                    if nent and (time.time() - nent) < Config.NEGATIVE_CACHE_TTL_SECONDS:
+                        NEG_CACHE_HITS_TOTAL.labels(tenant=tenant_label).inc()
+                        return {"answer": "", "sources": []}
 
     # Circuit breaker: short-circuit if open
     now_ts = int(time.time())
@@ -638,13 +680,22 @@ def ask(req: AskReq, request: Request):
             filt = {}
         ns = _get_cache_ns()
         ckey = f"ask:{ns}:{tenant_label}:{q}:{json.dumps(filt, sort_keys=True)}"
+        nkey = f"{ckey}:neg"
         if _redis is not None:
             try:
-                _redis.setex(ckey, Config.CACHE_TTL_SECONDS, json.dumps(resp))
+                # negative caching for empty answers
+                if Config.NEGATIVE_CACHE_ENABLED and ((not resp.get("answer")) or (not resp.get("sources"))):
+                    _redis.setex(nkey, Config.NEGATIVE_CACHE_TTL_SECONDS, "1")
+                else:
+                    _redis.setex(ckey, Config.CACHE_TTL_SECONDS, json.dumps(resp))
             except Exception:
                 pass
         else:
-            _cache[ckey] = {"v": resp, "t": time.time()}
+            # negative caching in memory
+            if Config.NEGATIVE_CACHE_ENABLED and ((not resp.get("answer")) or (not resp.get("sources"))):
+                _cache_neg[nkey] = time.time()
+            else:
+                _cache[ckey] = {"v": resp, "t": time.time()}
     return resp
 
 # SSE streaming endpoint (flag-gated)
@@ -727,6 +778,27 @@ def ask_stream(query: str, request: Request):
             for d in docs:
                 srcs.append({"source": d.metadata.get("source", ""), "page": d.metadata.get("page", None)})
             yield f"event: sources\ndata: {json.dumps(srcs)}\n\n"
+            # Update source index (for retention) with any observed date
+            try:
+                for d in docs:
+                    src = str(d.metadata.get("source", "")).strip()
+                    ds = str(d.metadata.get("date", ""))[:10]
+                    if not src or not ds:
+                        continue
+                    try:
+                        dt = datetime.fromisoformat(ds)
+                        score = int(dt.timestamp())
+                        if _redis is not None:
+                            try:
+                                _redis.zadd("sources:index", {src: score})
+                            except Exception:
+                                _source_index_mem[src] = score
+                        else:
+                            _source_index_mem[src] = score
+                    except Exception:
+                        continue
+            except Exception:
+                pass
             # stream answer in small chunks
             chunk = []
             count = 0
@@ -798,6 +870,52 @@ def admin_undelete(req: AdminSoftDeleteReq, request: Request):
     DOCS_SOFT_UNDELETES_TOTAL.inc()
     _bump_cache_ns()
     return {"status": "ok", "source": src}
+
+# Retention sweep metrics
+DOCS_RETENTION_SWEEPS_TOTAL = Counter(
+    "docs_retention_sweeps_total",
+    "Total retention sweeps executed",
+)
+DOCS_RETENTION_SOFT_DELETES_TOTAL = Counter(
+    "docs_retention_soft_deletes_total",
+    "Total sources soft-deleted by retention sweeps",
+)
+
+@app.post("/admin/retention/sweep", tags=["Admin"], summary="Apply retention window to soft-delete old sources")
+def retention_sweep(request: Request):
+    require_auth(request)
+    days = max(0, int(Config.DOC_RETENTION_DAYS))
+    if days <= 0:
+        return {"status": "skipped", "reason": "DOC_RETENTION_DAYS=0"}
+    cutoff_ts = int((datetime.utcnow() - timedelta(days=days)).timestamp())
+    deleted = 0
+    try:
+        if _redis is not None:
+            try:
+                olds = _redis.zrangebyscore("sources:index", "-inf", cutoff_ts)
+            except Exception:
+                olds = []
+        else:
+            olds = [s for s, sc in _source_index_mem.items() if sc <= cutoff_ts]
+    except Exception:
+        olds = []
+    for src in olds:
+        try:
+            if _redis is not None:
+                try:
+                    _redis.sadd("deny:sources", src)
+                except Exception:
+                    _deny_sources_mem.add(src)
+            else:
+                _deny_sources_mem.add(src)
+            deleted += 1
+        except Exception:
+            continue
+    DOCS_RETENTION_SWEEPS_TOTAL.inc()
+    if deleted:
+        DOCS_RETENTION_SOFT_DELETES_TOTAL.inc(deleted)
+        _bump_cache_ns()
+    return {"status": "ok", "deleted": deleted, "cutoff_ts": cutoff_ts}
 
 @app.get("/system", tags=["System"], summary="System state")
 def system_state():
