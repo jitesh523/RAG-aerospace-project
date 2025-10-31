@@ -8,28 +8,6 @@ def _get_cache_ns() -> int:
             return 1
         except Exception:
             pass
-    # Update source index (for retention) with any observed date
-    try:
-        cutoff_support = []
-        for d in docs:
-            src = str(d.metadata.get("source", "")).strip()
-            ds = str(d.metadata.get("date", ""))[:10]
-            if not src or not ds:
-                continue
-            try:
-                dt = datetime.fromisoformat(ds)
-                score = int(dt.timestamp())
-                if _redis is not None:
-                    try:
-                        _redis.zadd("sources:index", {src: score})
-                    except Exception:
-                        _source_index_mem[src] = score
-                else:
-                    _source_index_mem[src] = score
-            except Exception:
-                continue
-    except Exception:
-        pass
     return _cache_ns_mem
 
 def _bump_cache_ns() -> int:
@@ -45,6 +23,13 @@ def require_auth(request: Request) -> None:
     if not Config.API_KEY:
         return
     api_key = request.headers.get("x-api-key")
+    if api_key == Config.API_KEY:
+        return
+    authz = request.headers.get("authorization", "")
+    if authz.lower().startswith("bearer ") and _verify_jwt(authz.split(" ", 1)[1]):
+        return
+    raise HTTPException(status_code=401, detail="Invalid or missing API key/JWT")
+
 CACHE_HITS_TOTAL = Counter(
     "cache_hits_total",
     "/ask cache hits",
@@ -63,12 +48,6 @@ DOCS_SOFT_UNDELETES_TOTAL = Counter(
     "docs_soft_undeletes_total",
     "Total undeleted sources",
 )
-    if api_key == Config.API_KEY:
-        return
-    authz = request.headers.get("authorization", "")
-    if authz.lower().startswith("bearer ") and _verify_jwt(authz.split(" ", 1)[1]):
-        return
-    raise HTTPException(status_code=401, detail="Invalid or missing API key/JWT")
 
 def require_admin(request: Request) -> None:
     """Require caller to be admin.
@@ -165,6 +144,10 @@ COST_USD_TOTAL = Counter(
     "cost_usd_total",
     "Estimated USD cost",
     labelnames=["tenant"],
+)
+DENYLIST_SIZE = Gauge(
+    "denylist_size",
+    "Number of sources currently in denylist",
 )
 NEG_CACHE_HITS_TOTAL = Counter(
     "cache_negative_hits_total",
@@ -622,6 +605,10 @@ def ask(req: AskReq, request: Request):
             deny = set(_deny_sources_mem)
         if deny:
             docs = [d for d in docs if d.metadata.get("source") not in deny]
+        try:
+            DENYLIST_SIZE.set(len(deny))
+        except Exception:
+            pass
     except Exception:
         pass
     # Apply simple metadata filters
@@ -803,6 +790,10 @@ def ask_stream(query: str, request: Request):
                     deny = set(_deny_sources_mem)
                 if deny:
                     docs = [d for d in docs if d.metadata.get("source") not in deny]
+                try:
+                    DENYLIST_SIZE.set(len(deny))
+                except Exception:
+                    pass
             except Exception:
                 pass
             # first send sources metadata
@@ -880,6 +871,19 @@ def admin_delete(req: AdminSoftDeleteReq, request: Request):
         _deny_sources_mem.add(src)
     DOCS_SOFT_DELETES_TOTAL.inc()
     _bump_cache_ns()
+    try:
+        # update gauge after mutation
+        cur = set()
+        if _redis is not None:
+            try:
+                cur = set(_redis.smembers("deny:sources"))
+            except Exception:
+                cur = set(_deny_sources_mem)
+        else:
+            cur = set(_deny_sources_mem)
+        DENYLIST_SIZE.set(len(cur))
+    except Exception:
+        pass
     return {"status": "ok", "source": src}
 
 @app.post("/admin/docs/undelete", tags=["Admin"], summary="Remove a source from denylist")
@@ -901,6 +905,18 @@ def admin_undelete(req: AdminSoftDeleteReq, request: Request):
             pass
     DOCS_SOFT_UNDELETES_TOTAL.inc()
     _bump_cache_ns()
+    try:
+        cur = set()
+        if _redis is not None:
+            try:
+                cur = set(_redis.smembers("deny:sources"))
+            except Exception:
+                cur = set(_deny_sources_mem)
+        else:
+            cur = set(_deny_sources_mem)
+        DENYLIST_SIZE.set(len(cur))
+    except Exception:
+        pass
     return {"status": "ok", "source": src}
 
 # Retention sweep metrics
@@ -947,6 +963,18 @@ def retention_sweep(request: Request):
     if deleted:
         DOCS_RETENTION_SOFT_DELETES_TOTAL.inc(deleted)
         _bump_cache_ns()
+    try:
+        cur = set()
+        if _redis is not None:
+            try:
+                cur = set(_redis.smembers("deny:sources"))
+            except Exception:
+                cur = set(_deny_sources_mem)
+        else:
+            cur = set(_deny_sources_mem)
+        DENYLIST_SIZE.set(len(cur))
+    except Exception:
+        pass
     return {"status": "ok", "deleted": deleted, "cutoff_ts": cutoff_ts}
 
 @app.get("/system", tags=["System"], summary="System state")
@@ -955,6 +983,19 @@ def system_state():
     open_state = 1 if (_cb_open_until and now_ts < _cb_open_until) else 0
     try:
         CIRCUIT_STATE.labels(component="llm").set(open_state)
+    except Exception:
+        pass
+    # also set denylist gauge on system read
+    try:
+        cur = set()
+        if _redis is not None:
+            try:
+                cur = set(_redis.smembers("deny:sources"))
+            except Exception:
+                cur = set(_deny_sources_mem)
+        else:
+            cur = set(_deny_sources_mem)
+        DENYLIST_SIZE.set(len(cur))
     except Exception:
         pass
     return {

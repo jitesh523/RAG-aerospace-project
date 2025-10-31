@@ -1,0 +1,67 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cost-report-scripts
+data:
+  cost_report.py: |
+    import os, json, datetime, sys
+    import requests
+    try:
+      import boto3
+    except Exception:
+      boto3 = None
+
+    PROM_URL = os.getenv("PROM_URL")
+    PROM_BEARER = os.getenv("PROM_BEARER", "")
+    BUCKET = os.getenv("S3_BUCKET")
+    PREFIX = os.getenv("S3_PREFIX", "cost-reports/")
+
+    if not PROM_URL or not BUCKET:
+      print("PROM_URL and S3_BUCKET are required", file=sys.stderr)
+      sys.exit(1)
+
+    headers = {"Accept": "application/json"}
+    if PROM_BEARER:
+      headers["Authorization"] = f"Bearer {PROM_BEARER}"
+
+    def q(expr: str):
+      r = requests.get(f"{PROM_URL}/api/v1/query", params={"query": expr}, headers=headers, timeout=15)
+      r.raise_for_status()
+      data = r.json()
+      if data.get("status") != "success":
+        return []
+      return data.get("data", {}).get("result", [])
+
+    # Compute last day increases per tenant
+    queries = {
+      "prompt_tokens": "sum by (tenant) (increase(tokens_prompt_total[1d]))",
+      "completion_tokens": "sum by (tenant) (increase(tokens_completion_total[1d]))",
+      "cost_usd": "sum by (tenant) (increase(cost_usd_total[1d]))",
+    }
+
+    report = {"date": datetime.date.today().isoformat(), "tenants": {}}
+    for key, expr in queries.items():
+      try:
+        res = q(expr)
+        for series in res:
+          tenant = series.get("metric", {}).get("tenant", "unknown")
+          val = 0.0
+          try:
+            val = float(series.get("value", [0, "0"])[1])
+          except Exception:
+            pass
+          entry = report["tenants"].setdefault(tenant, {"prompt_tokens": 0.0, "completion_tokens": 0.0, "cost_usd": 0.0})
+          entry[key] = val
+      except Exception:
+        continue
+
+    body = json.dumps(report, indent=2)
+    key = f"{PREFIX.rstrip('/')}/{report['date']}.json"
+
+    if boto3 is None:
+      print(body)
+      sys.exit(0)
+
+    s3 = boto3.client("s3")
+    s3.put_object(Bucket=BUCKET, Key=key, Body=body.encode("utf-8"), ContentType="application/json")
+    print(f"wrote s3://{BUCKET}/{key}")

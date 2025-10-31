@@ -1,0 +1,64 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cost-report
+spec:
+  schedule: "10 3 * * *" # daily at 03:10
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: reporter
+              image: python:3.11-alpine
+              command: ["/bin/sh","-lc"]
+              args:
+                - |
+                  set -e
+                  python -m pip install --no-cache-dir requests boto3
+                  python /opt/scripts/cost_report.py
+              env:
+                - name: PROM_URL
+                  valueFrom:
+                    configMapKeyRef:
+                      name: rag-config
+                      key: PROM_URL
+                - name: PROM_BEARER
+                  valueFrom:
+                    secretKeyRef:
+                      name: rag-secrets
+                      key: PROM_BEARER
+                - name: S3_BUCKET
+                  valueFrom:
+                    secretKeyRef:
+                      name: rag-secrets
+                      key: S3_BUCKET
+                - name: S3_PREFIX
+                  valueFrom:
+                    secretKeyRef:
+                      name: rag-secrets
+                      key: S3_PREFIX
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: rag-secrets
+                      key: AWS_ACCESS_KEY_ID
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: rag-secrets
+                      key: AWS_SECRET_ACCESS_KEY
+                - name: AWS_DEFAULT_REGION
+                  valueFrom:
+                    secretKeyRef:
+                      name: rag-secrets
+                      key: AWS_DEFAULT_REGION
+              volumeMounts:
+                - name: scripts
+                  mountPath: /opt/scripts
+          volumes:
+            - name: scripts
+              configMap:
+                name: cost-report-scripts
+                defaultMode: 0555
