@@ -382,6 +382,22 @@ Response:
 {"limit": 1000, "used_today": 42}
 ```
 
+## 🔐 Secrets & Admin
+
+- External Secrets (ESO): manifests under `k8s/manifests/secretstore-cloud.yaml` and `external-secret-rag-secrets.yaml` materialize `rag-secrets` from your cloud secret store.
+- Admin endpoints under `/admin/**` require admin privileges:
+  - With API key: include `x-api-key: $API_KEY` (treated as admin)
+  - With JWT: token must include `admin` in `scope`/`scopes`/`scp` or in `roles`
+
+## 🧹 Retention Sweeper
+
+- Set `DOC_RETENTION_DAYS>0` to enable retention logic. Sources observed in responses are indexed by their `metadata.date` and swept when older than the cutoff.
+- Endpoint: `POST /admin/retention/sweep` (admin required) performs a sweep.
+- CronJob: `k8s/manifests/docs-retention-sweeper-cronjob.yaml` runs daily at 03:00 and calls the sweep.
+- Metrics:
+  - `docs_retention_sweeps_total`
+  - `docs_retention_soft_deletes_total`
+
 Grafana panel: sum by tenant of `ask_usage_total`.
 
 ## 🚀 Autoscaling (KEDA)
@@ -413,6 +429,9 @@ Outputs JSON with averages and per-query details. Configure with `EVAL_K` and `G
 - Quota usage: `sum by (tenant) (ask_usage_total)`
 - Embedding metrics: `embed_batches_total`, `embed_items_total`, `embed_batch_duration_seconds` (p95 panel example included)
 - Circuit breaker: `circuit_state{component="llm"}` (0=closed, 1=open)
+- Cache hit ratio by tenant: `sum by (tenant)(rate(cache_hits_total[5m])) / (sum by (tenant)(rate(cache_hits_total[5m])) + sum by (tenant)(rate(cache_misses_total[5m])))`
+- Retention deletes/day: `rate(docs_retention_soft_deletes_total[1d])`
+- Cost USD rate by tenant: `sum by (tenant)(rate(cost_usd_total[5m]))`
 
 ## 🔍 System Endpoint
 
