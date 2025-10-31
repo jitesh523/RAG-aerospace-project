@@ -398,6 +398,13 @@ Response:
   - `docs_retention_sweeps_total`
   - `docs_retention_soft_deletes_total`
 
+## 💰 Daily Cost Report
+
+- CronJob: `k8s/manifests/cost-report-cronjob.yaml` runs `cost_report.py` (see ConfigMap) daily to query Prometheus and write a per-tenant cost report JSON to S3.
+- Requirements:
+  - `rag-config` must define `PROM_URL` (e.g., `http://prometheus-server.prometheus:9090`).
+  - `rag-secrets` should hold `PROM_BEARER` (if Prometheus requires auth), `S3_BUCKET`, `S3_PREFIX`, and AWS credentials.
+
 Grafana panel: sum by tenant of `ask_usage_total`.
 
 ## 🚀 Autoscaling (KEDA)
