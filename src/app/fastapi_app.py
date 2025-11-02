@@ -154,6 +154,21 @@ NEG_CACHE_HITS_TOTAL = Counter(
     "/ask negative cache hits",
     labelnames=["tenant"],
 )
+AB_DECISIONS_TOTAL = Counter(
+    "ab_decisions_total",
+    "AB routing decisions for /ask",
+    labelnames=["tenant", "llm", "rerank"],
+)
+SEM_CACHE_HITS_TOTAL = Counter(
+    "semantic_cache_hits_total",
+    "/ask semantic cache hits",
+    labelnames=["tenant"],
+)
+SEM_CACHE_MISSES_TOTAL = Counter(
+    "semantic_cache_misses_total",
+    "/ask semantic cache misses",
+    labelnames=["tenant"],
+)
 from fastapi import FastAPI
 from pydantic import BaseModel
 from starlette_exporter import PrometheusMiddleware, handle_metrics
@@ -170,6 +185,7 @@ import json
 import jwt
 import redis
 import requests
+import hashlib
 from typing import Optional
 from opentelemetry import trace as ot_trace
 from opentelemetry.sdk.resources import Resource
@@ -294,6 +310,11 @@ class ReadyResp(BaseModel):
 
 qa_chain = None
 READY = False
+# cache of QA chains by (model, rerank_enabled)
+_qa_cache = {}
+# AB routing maps (in-memory fallback)
+_ab_llm_mem = {}   # tenant -> 'A'|'B'
+_ab_rerank_mem = {}  # tenant -> 'true'|'false'
 _rerank_model = None
 _cb_failures = 0
 _cb_open_until = 0
@@ -322,6 +343,10 @@ if Config.REDIS_URL:
     
 # Simple in-memory cache structure: key -> {v: response_json, t: epoch}
 _cache = {}
+# In-memory semantic cache: key -> {v: resp_json, t: epoch}
+_sem_cache = {}
+# In-memory feedback buffer fallback (tenant -> list of dict)
+_feedback_mem = {}
 
 # JWKS cache and verification helpers
 _jwks_cache = {"keys": None, "fetched_at": 0}
@@ -413,6 +438,7 @@ async def add_request_id_and_logging(request: Request, call_next):
 def _startup():
     global qa_chain, READY
     try:
+        # Build a default chain for readiness checks
         qa_chain = build_chain()
         # Basic readiness check: FAISS store presence + chain built
         faiss_path_exists = os.path.isdir("./faiss_store")
@@ -497,8 +523,49 @@ def ask(req: AskReq, request: Request):
         raise HTTPException(status_code=400, detail="Query too long (max 4000 chars)")
     if not READY or qa_chain is None:
         raise HTTPException(status_code=503, detail="Service not ready. Ingest documents to create ./faiss_store and restart.")
-    # Cache get (if enabled) keyed by query+filters+tenant
+    # Determine AB routing for this tenant
     tenant_label = _tenant_from_key(api_key_hdr)
+    def _get_llm_variant(t: str) -> str:
+        # redis hash ab:llm maps tenant->'A'|'B'
+        if _redis is not None:
+            try:
+                v = _redis.hget("ab:llm", t)
+                if v in ("A","B"):
+                    return v
+            except Exception:
+                pass
+        return _ab_llm_mem.get(t) or "A"
+    def _get_rerank_enabled(t: str) -> bool:
+        if _redis is not None:
+            try:
+                v = _redis.hget("ab:rerank", t)
+                if v is not None:
+                    return str(v).lower() == "true"
+            except Exception:
+                pass
+        if t in _ab_rerank_mem:
+            return str(_ab_rerank_mem.get(t)).lower() == "true"
+        return bool(Config.HYBRID_ENABLED)
+    llm_variant = _get_llm_variant(tenant_label)
+    model_name = Config.LLM_MODEL_A if llm_variant == "A" else Config.LLM_MODEL_B
+    rerank_enabled = _get_rerank_enabled(tenant_label)
+    # Build or reuse chain for this routing
+    key_rt = (model_name, bool(rerank_enabled))
+    chain = _qa_cache.get(key_rt)
+    if chain is None:
+        try:
+            chain = build_chain(filters=req.filters, llm_model=model_name, rerank_enabled=rerank_enabled)
+            _qa_cache[key_rt] = chain
+        except Exception:
+            chain = None
+    if chain is None:
+        # Fallback to default
+        chain = qa_chain
+    try:
+        AB_DECISIONS_TOTAL.labels(tenant=tenant_label, llm=llm_variant, rerank=str(bool(rerank_enabled)).lower()).inc()
+    except Exception:
+        pass
+    # Cache get (if enabled) keyed by query+filters+tenant
     ns = _get_cache_ns()
     if Config.CACHE_ENABLED:
         try:
@@ -536,6 +603,28 @@ def ask(req: AskReq, request: Request):
                         NEG_CACHE_HITS_TOTAL.labels(tenant=tenant_label).inc()
                         return {"answer": "", "sources": []}
 
+    # Semantic cache (feature-flagged)
+    if Config.SEMANTIC_CACHE_ENABLED:
+        simhash_key = _simhash(q, req.filters)
+        skey = f"sem:{ns}:{tenant_label}:{simhash_key}"
+        if _redis is not None:
+            try:
+                cached = _redis.get(skey)
+                if cached:
+                    SEM_CACHE_HITS_TOTAL.labels(tenant=tenant_label).inc()
+                    return json.loads(cached)
+                else:
+                    SEM_CACHE_MISSES_TOTAL.labels(tenant=tenant_label).inc()
+            except Exception:
+                pass
+        else:
+            ent = _sem_cache.get(skey)
+            if ent and (time.time() - ent["t"]) < Config.SEMANTIC_CACHE_TTL_SECONDS:
+                SEM_CACHE_HITS_TOTAL.labels(tenant=tenant_label).inc()
+                return ent["v"]
+            else:
+                SEM_CACHE_MISSES_TOTAL.labels(tenant=tenant_label).inc()
+
     # Circuit breaker: short-circuit if open
     now_ts = int(time.time())
     if _cb_open_until and now_ts < _cb_open_until:
@@ -553,7 +642,7 @@ def ask(req: AskReq, request: Request):
                 cur.set_attribute("query.length", len(q))
                 cur.set_attribute("retriever.backend", os.getenv("RETRIEVER_BACKEND", Config.RETRIEVER_BACKEND))
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                fut = ex.submit(qa_chain.invoke, q)
+                fut = ex.submit(chain.invoke, q)
                 try:
                     result = fut.result(timeout=max(1, Config.LLM_TIMEOUT_SECONDS))
                 except concurrent.futures.TimeoutError:
@@ -715,6 +804,17 @@ def ask(req: AskReq, request: Request):
                 _cache_neg[nkey] = time.time()
             else:
                 _cache[ckey] = {"v": resp, "t": time.time()}
+    # Semantic cache set
+    if Config.SEMANTIC_CACHE_ENABLED:
+        simhash_key = _simhash(q, req.filters)
+        skey = f"sem:{ns}:{tenant_label}:{simhash_key}"
+        if _redis is not None:
+            try:
+                _redis.setex(skey, Config.SEMANTIC_CACHE_TTL_SECONDS, json.dumps(resp))
+            except Exception:
+                pass
+        else:
+            _sem_cache[skey] = {"v": resp, "t": time.time()}
     return resp
 
 # SSE streaming endpoint (flag-gated)
@@ -855,6 +955,14 @@ def ask_stream(query: str, request: Request):
 class AdminSoftDeleteReq(BaseModel):
     source: str
 
+class AdminABLLMReq(BaseModel):
+    tenant: str
+    variant: str  # 'A' or 'B'
+
+class AdminABRerankReq(BaseModel):
+    tenant: str
+    enabled: bool
+
 @app.post("/admin/docs/delete", tags=["Admin"], summary="Soft-delete a source (denylist)")
 def admin_delete(req: AdminSoftDeleteReq, request: Request):
     require_admin(request)
@@ -918,6 +1026,47 @@ def admin_undelete(req: AdminSoftDeleteReq, request: Request):
     except Exception:
         pass
     return {"status": "ok", "source": src}
+
+@app.post("/admin/ab/llm", tags=["Admin"], summary="Set LLM variant (A/B) for a tenant")
+def admin_set_llm(req: AdminABLLMReq, request: Request):
+    require_admin(request)
+    t = (req.tenant or "").strip()
+    v = (req.variant or "").strip().upper()
+    if v not in ("A","B") or not t:
+        raise HTTPException(status_code=400, detail="variant must be 'A' or 'B' and tenant required")
+    try:
+        if _redis is not None:
+            try:
+                _redis.hset("ab:llm", t, v)
+            except Exception:
+                _ab_llm_mem[t] = v
+        else:
+            _ab_llm_mem[t] = v
+        # Clear cached chains for this tenant's variants is not tenant-specific; clear all caches to be safe
+        _qa_cache.clear()
+        return {"status": "ok", "tenant": t, "variant": v}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/admin/ab/rerank", tags=["Admin"], summary="Enable/disable reranker for a tenant")
+def admin_set_rerank(req: AdminABRerankReq, request: Request):
+    require_admin(request)
+    t = (req.tenant or "").strip()
+    val = bool(req.enabled)
+    if not t:
+        raise HTTPException(status_code=400, detail="tenant required")
+    try:
+        if _redis is not None:
+            try:
+                _redis.hset("ab:rerank", t, "true" if val else "false")
+            except Exception:
+                _ab_rerank_mem[t] = "true" if val else "false"
+        else:
+            _ab_rerank_mem[t] = "true" if val else "false"
+        _qa_cache.clear()
+        return {"status": "ok", "tenant": t, "enabled": val}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Retention sweep metrics
 DOCS_RETENTION_SWEEPS_TOTAL = Counter(

@@ -89,3 +89,16 @@ class Config:
     NEGATIVE_CACHE_TTL_SECONDS = int(os.getenv("NEGATIVE_CACHE_TTL_SECONDS", "15"))
     # Retention window (days). 0 disables retention sweeps.
     DOC_RETENTION_DAYS = int(os.getenv("DOC_RETENTION_DAYS", "0"))
+    # Semantic cache
+    SEMANTIC_CACHE_ENABLED = os.getenv("SEMANTIC_CACHE_ENABLED", "false").lower() == "true"
+    SEMANTIC_CACHE_TTL_SECONDS = int(os.getenv("SEMANTIC_CACHE_TTL_SECONDS", "300"))
+    SEMANTIC_CACHE_SIMHASH_BITS = int(os.getenv("SEMANTIC_CACHE_SIMHASH_BITS", "64"))
+    # Async ingestion (Redis Streams)
+    INGEST_STREAM = os.getenv("INGEST_STREAM", "ingest:chunks")
+    INGEST_GROUP = os.getenv("INGEST_GROUP", "workers")
+    INGEST_CONCURRENCY = int(os.getenv("INGEST_CONCURRENCY", "1"))
+    INGEST_MAX_RETRIES = int(os.getenv("INGEST_MAX_RETRIES", "5"))
+    INGEST_DLQ_STREAM = os.getenv("INGEST_DLQ_STREAM", "ingest:dlq")
+    # AB routing models
+    LLM_MODEL_A = os.getenv("LLM_MODEL_A", "gpt-4o-mini")
+    LLM_MODEL_B = os.getenv("LLM_MODEL_B", "gpt-4o-mini")
