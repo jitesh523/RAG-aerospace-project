@@ -82,6 +82,24 @@ def run_worker():
                         emb = embed_clients[model_name].embed_query(data["text"])
                         part = Config.INGEST_TENANT if Config.MILVUS_PARTITIONED and Config.INGEST_TENANT else None
                         insert_rows([(data["id"][:32], emb, data["text"][:65000], data["source"], data["page"])], partition=part)
+                        # update filter metadata per tenant (Redis-first)
+                        try:
+                            tenant = Config.INGEST_TENANT or "__default__"
+                            r.sadd(f"filt:{tenant}:sources", str(data.get("source", "")))
+                            if data.get("doc_type"):
+                                r.sadd(f"filt:{tenant}:doc_types", str(data.get("doc_type")))
+                            if data.get("date"):
+                                d = str(data.get("date"))[:10]
+                                kmin = f"filt:{tenant}:date_min"
+                                kmax = f"filt:{tenant}:date_max"
+                                cur_min = r.get(kmin)
+                                cur_max = r.get(kmax)
+                                if not cur_min or d < cur_min:
+                                    r.set(kmin, d)
+                                if not cur_max or d > cur_max:
+                                    r.set(kmax, d)
+                        except Exception:
+                            pass
                         r.sadd(seen_key, data["id"])
                         r.xack(stream, group, msg_id)
                         INGEST_WORKER_PROCESSED.inc()

@@ -1131,28 +1131,43 @@ def ask(req: AskReq, request: Request):
 def submit_feedback(req: FeedbackReq, request: Request):
     require_auth(request)
     tenant = _tenant_from_key(request.headers.get("x-api-key"))
-    item = {
-        "ts": int(time.time()),
-        "tenant": tenant,
-        "query": req.query,
-        "answer": req.answer,
-        "helpful": bool(req.helpful),
-        "clicked_sources": req.clicked_sources or [],
-        "request_id": getattr(getattr(request, "state", None), "request_id", ""),
-    }
-    FEEDBACK_TOTAL.labels(tenant=tenant, helpful=str(bool(req.helpful)).lower()).inc()
-    # Try Redis list first, fallback to in-memory buffer
+    try:
+        helpful = bool(req.helpful)
+        FEEDBACK_TOTAL.labels(tenant=tenant, helpful=str(helpful).lower()).inc()
+    except Exception:
+        pass
     if _redis_usable():
         try:
-            _redis.rpush(f"feedback:{tenant}", json.dumps(item))
-            return {"ok": True}
+            _redis.rpush("feedback", json.dumps({"tenant": tenant, "helpful": helpful, "reason": req.reason or ""}))
         except Exception:
             _record_redis_failure()
-            pass
-    buf = _feedback_mem.get(tenant) or []
-    buf.append(item)
-    _feedback_mem[tenant] = buf
+            _feedback_mem.setdefault(tenant, []).append({"helpful": helpful, "reason": req.reason or ""})
+    else:
+        _feedback_mem.setdefault(tenant, []).append({"helpful": helpful, "reason": req.reason or ""})
     return {"ok": True}
+
+@app.get(
+    "/filters",
+    tags=["Filters"],
+    summary="List available filters for the authenticated tenant",
+)
+def list_filters(request: Request):
+    require_auth(request)
+    tenant = _tenant_from_key(request.headers.get("x-api-key"))
+    res = {"tenant": tenant, "sources": [], "doc_types": [], "date_min": None, "date_max": None}
+    if _redis_usable():
+        try:
+            s_key = f"filt:{tenant}:sources"
+            d_key = f"filt:{tenant}:doc_types"
+            res["sources"] = sorted([m.decode("utf-8") if isinstance(m, (bytes, bytearray)) else str(m) for m in (_redis.smembers(s_key) or set()) if str(m)])
+            res["doc_types"] = sorted([m.decode("utf-8") if isinstance(m, (bytes, bytearray)) else str(m) for m in (_redis.smembers(d_key) or set()) if str(m)])
+            res["date_min"] = _redis.get(f"filt:{tenant}:date_min")
+            res["date_max"] = _redis.get(f"filt:{tenant}:date_max")
+            return res
+        except Exception:
+            _record_redis_failure()
+            return res
+    return res
 
 # SSE streaming endpoint (flag-gated)
 @app.get("/ask/stream")
