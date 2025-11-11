@@ -1254,6 +1254,21 @@ def ask_stream(query: str, request: Request):
             for d in docs:
                 srcs.append({"source": d.metadata.get("source", ""), "page": d.metadata.get("page", None)})
             yield f"event: sources\ndata: {json.dumps(srcs)}\n\n"
+            # optionally send explain previews
+            if Config.EXPLAIN_ENABLED:
+                try:
+                    max_chars = max(0, int(Config.EXPLAIN_PREVIEW_CHARS))
+                    previews = []
+                    for d in docs:
+                        txt = getattr(d, "page_content", "") or ""
+                        previews.append({
+                            "source": d.metadata.get("source", ""),
+                            "page": d.metadata.get("page", None),
+                            "preview": txt[:max_chars],
+                        })
+                    yield f"event: explain\ndata: {json.dumps(previews)}\n\n"
+                except Exception:
+                    pass
             # Update source index (for retention) with any observed date
             try:
                 for d in docs:
@@ -1275,10 +1290,11 @@ def ask_stream(query: str, request: Request):
                         continue
             except Exception:
                 pass
-            # stream answer in small chunks
+            # stream answer in small chunks (with PII redaction if enabled)
+            safe_full = _redact_pii(full)
             chunk = []
             count = 0
-            for ch in full.split():
+            for ch in safe_full.split():
                 chunk.append(ch)
                 count += len(ch) + 1
                 if count >= 128:
