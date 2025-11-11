@@ -76,6 +76,24 @@
         {"refId": "B", "expr": "2"},
         {"refId": "C", "condition": "A > B"}
       ]
+    },
+    {
+      "title": "Offline Eval Recall < 0.7",
+      "condition": "C",
+      "data": [
+        {"refId": "A", "expr": "offline_eval_recall_last"},
+        {"refId": "B", "expr": "0.7"},
+        {"refId": "C", "condition": "A < B"}
+      ]
+    },
+    {
+      "title": "Offline Eval AnswerContains < 0.6",
+      "condition": "C",
+      "data": [
+        {"refId": "A", "expr": "offline_eval_answer_contains_last"},
+        {"refId": "B", "expr": "0.6"},
+        {"refId": "C", "condition": "A < B"}
+      ]
     }
   ]
 }
