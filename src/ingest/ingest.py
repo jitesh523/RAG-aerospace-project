@@ -76,6 +76,22 @@ def to_milvus_rows(chunks, embeddings):
         rows.append((rid, emb, doc.page_content[:65000], src, page))
     return rows
 
+def _parse_model_map(map_str: str):
+    mp = {}
+    try:
+        for p in [x.strip() for x in (map_str or "").split(",") if x.strip()]:
+            k, v = p.split(":", 1)
+            mp[k.strip()] = v.strip().lower()
+    except Exception:
+        pass
+    return mp
+
+def _select_embed_model(doc_type: str) -> str:
+    mp = _parse_model_map(Config.EMBED_MODEL_MAP)
+    key = (doc_type or "").lower() or "default"
+    which = mp.get(key) or mp.get("default") or "large"
+    return Config.EMBED_MODEL_SMALL if which == "small" else Config.EMBED_MODEL_LARGE
+
 def main(input_dir: str, batch_size: int):
     docs = load_pdfs(input_dir)
     chunks = chunk_docs(docs)
@@ -84,7 +100,9 @@ def main(input_dir: str, batch_size: int):
     faiss_index.save_local("./faiss_store")
 
     # Persist everything to Milvus
-    embeddings = OpenAIEmbeddings(model=Config.EMBED_MODEL, api_key=Config.OPENAI_API_KEY)
+    # PDFs => doc_type 'pdf' for model selection
+    embed_model = _select_embed_model("pdf")
+    embeddings = OpenAIEmbeddings(model=embed_model, api_key=Config.OPENAI_API_KEY)
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i:i+batch_size]
         rows = to_milvus_rows(batch, embeddings)
@@ -92,7 +110,8 @@ def main(input_dir: str, batch_size: int):
         ins_delay = max(0.001, Config.RETRY_BASE_DELAY_MS / 1000.0)
         while True:
             try:
-                insert_rows(rows)
+                part = Config.INGEST_TENANT if Config.MILVUS_PARTITIONED and Config.INGEST_TENANT else None
+                insert_rows(rows, partition=part)
                 break
             except Exception:
                 ins_attempt += 1

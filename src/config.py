@@ -6,9 +6,13 @@ load_dotenv()
 class Config:
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
     EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-large")
+    EMBED_MODEL_SMALL = os.getenv("EMBED_MODEL_SMALL", "text-embedding-3-small")
+    EMBED_MODEL_LARGE = os.getenv("EMBED_MODEL_LARGE", "text-embedding-3-large")
+    EMBED_MODEL_MAP = os.getenv("EMBED_MODEL_MAP", "default:large")  # e.g. "pdf:small,html:small,docx:large,default:large"
     MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
     MILVUS_PORT = int(os.getenv("MILVUS_PORT", "19530"))
     MILVUS_COLLECTION = os.getenv("MILVUS_COLLECTION", "aero_docs_v1")
+    MILVUS_PARTITIONED = os.getenv("MILVUS_PARTITIONED", "false").lower() == "true"
     PORT = int(os.getenv("PORT", "8000"))
     ENV = os.getenv("ENV", "local")
     # Retriever backend: "faiss" or "milvus"
@@ -22,7 +26,8 @@ class Config:
     # Auth & rate limiting
     API_KEY = os.getenv("API_KEY")  # if set, required for /ask
     METRICS_PUBLIC = os.getenv("METRICS_PUBLIC", "true").lower() == "true"
-    RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "60"))
+    _DEFAULT_RL = "60" if ENV == "local" else "30"
+    RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", _DEFAULT_RL))
     REDIS_URL = os.getenv("REDIS_URL")
     # JWT (HMAC) support
     JWT_SECRET = os.getenv("JWT_SECRET")
@@ -61,6 +66,9 @@ class Config:
     # Reranking
     RERANK_ENABLED = os.getenv("RERANK_ENABLED", "false").lower() == "true"
     RERANK_MODEL = os.getenv("RERANK_MODEL", "")
+    RERANK_MAX_DOCS = int(os.getenv("RERANK_MAX_DOCS", "10"))
+    RERANK_MODEL_A = os.getenv("RERANK_MODEL_A", "")
+    RERANK_MODEL_B = os.getenv("RERANK_MODEL_B", "")
     # Hybrid search (vector + term scoring)
     HYBRID_ENABLED = os.getenv("HYBRID_ENABLED", "false").lower() == "true"
     HYBRID_ALPHA = float(os.getenv("HYBRID_ALPHA", "0.7"))
@@ -80,6 +88,9 @@ class Config:
     # Multi-tenancy
     MULTITENANT_ENABLED = os.getenv("MULTITENANT_ENABLED", "false").lower() == "true"
     TENANT_METADATA_FIELD = os.getenv("TENANT_METADATA_FIELD", "tenant")
+    # Governance & compliance
+    PII_REDACTION_ENABLED = os.getenv("PII_REDACTION_ENABLED", "false").lower() == "true"
+    AUDIT_ENABLED = os.getenv("AUDIT_ENABLED", "true").lower() == "true"
     # Cost visibility (approximate)
     COST_ENABLED = os.getenv("COST_ENABLED", "true").lower() == "true"
     COST_PER_1K_PROMPT_TOKENS = float(os.getenv("COST_PER_1K_PROMPT_TOKENS", "0.005"))
@@ -93,12 +104,27 @@ class Config:
     SEMANTIC_CACHE_ENABLED = os.getenv("SEMANTIC_CACHE_ENABLED", "false").lower() == "true"
     SEMANTIC_CACHE_TTL_SECONDS = int(os.getenv("SEMANTIC_CACHE_TTL_SECONDS", "300"))
     SEMANTIC_CACHE_SIMHASH_BITS = int(os.getenv("SEMANTIC_CACHE_SIMHASH_BITS", "64"))
+    SEMANTIC_CACHE_TTL_TENANT = os.getenv("SEMANTIC_CACHE_TTL_TENANT", "")  # e.g. "tenantA:600,tenantB:120"
+    # Query expansion
+    QUERY_EXPANSION_ENABLED = os.getenv("QUERY_EXPANSION_ENABLED", "false").lower() == "true"
     # Async ingestion (Redis Streams)
     INGEST_STREAM = os.getenv("INGEST_STREAM", "ingest:chunks")
     INGEST_GROUP = os.getenv("INGEST_GROUP", "workers")
     INGEST_CONCURRENCY = int(os.getenv("INGEST_CONCURRENCY", "1"))
     INGEST_MAX_RETRIES = int(os.getenv("INGEST_MAX_RETRIES", "5"))
     INGEST_DLQ_STREAM = os.getenv("INGEST_DLQ_STREAM", "ingest:dlq")
+    INGEST_TENANT = os.getenv("INGEST_TENANT", "")
     # AB routing models
     LLM_MODEL_A = os.getenv("LLM_MODEL_A", "gpt-4o-mini")
     LLM_MODEL_B = os.getenv("LLM_MODEL_B", "gpt-4o-mini")
+    # Phase 6: Cost controls
+    BUDGET_ENABLED = os.getenv("BUDGET_ENABLED", "false").lower() == "true"
+    BUDGET_DEFAULT_DAILY_USD = float(os.getenv("BUDGET_DEFAULT_DAILY_USD", "50.0"))
+    BUDGET_WARN_FRACTION = float(os.getenv("BUDGET_WARN_FRACTION", "0.8"))
+    LLM_MODEL_CHEAP = os.getenv("LLM_MODEL_CHEAP", "gpt-4o-mini")
+    # Phase 7: Explainability
+    EXPLAIN_ENABLED = os.getenv("EXPLAIN_ENABLED", "false").lower() == "true"
+    EXPLAIN_PREVIEW_CHARS = int(os.getenv("EXPLAIN_PREVIEW_CHARS", "240"))
+    # Phase 7: Export answers with citations
+    EXPORT_ENABLED = os.getenv("EXPORT_ENABLED", "true").lower() == "true"
+    EXPORT_FORMAT = os.getenv("EXPORT_FORMAT", "markdown").lower()

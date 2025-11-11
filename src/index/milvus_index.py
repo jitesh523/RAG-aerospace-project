@@ -27,10 +27,19 @@ def ensure_collection(name: str = Config.MILVUS_COLLECTION) -> Collection:
     col.load()
     return col
 
-def insert_rows(rows: List[Tuple[str, list, str, str, int]], name: str = Config.MILVUS_COLLECTION):
+def _ensure_partition(col: Collection, partition: str):
+    try:
+        if partition and partition not in [p.name for p in col.partitions]:
+            col.create_partition(partition)
+    except Exception:
+        pass
+
+def insert_rows(rows: List[Tuple[str, list, str, str, int]], name: str = Config.MILVUS_COLLECTION, partition: str | None = None):
     col = ensure_collection(name)
+    if partition:
+        _ensure_partition(col, partition)
     ids, embeds, texts, sources, pages = zip(*rows)
-    col.insert([list(ids), list(embeds), list(texts), list(sources), list(pages)])
+    col.insert([list(ids), list(embeds), list(texts), list(sources), list(pages)], partition_name=partition)
     col.flush()
 
 def check_milvus_readiness(name: str = Config.MILVUS_COLLECTION) -> dict:
