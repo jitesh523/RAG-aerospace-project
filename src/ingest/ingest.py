@@ -1,11 +1,14 @@
-import argparse, os, uuid, time
+import argparse
+import os
+import uuid
+import time
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 from src.index.faiss_index import build_faiss
 from src.index.milvus_index import insert_rows
 from src.config import Config
-from prometheus_client import Counter, Histogram, CollectorRegistry, pushadd_to_gateway, REGISTRY
+from prometheus_client import Counter, Histogram, pushadd_to_gateway, REGISTRY
 
 EMBED_BATCHES_TOTAL = Counter(
     "embed_batches_total",

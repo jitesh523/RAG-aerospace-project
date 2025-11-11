@@ -1,3 +1,40 @@
+import os
+import time
+import uuid
+import logging
+import json
+import hashlib
+from typing import Optional
+from datetime import datetime, timedelta
+
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from starlette.responses import StreamingResponse, PlainTextResponse, JSONResponse
+from starlette_exporter import PrometheusMiddleware, handle_metrics
+from prometheus_client import Counter, Gauge, Histogram
+
+import jwt
+import redis
+import requests
+import concurrent.futures
+
+from opentelemetry import trace as ot_trace
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+import sentry_sdk
+from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
+
+from src.app.deps import build_chain
+from src.config import Config
+from src.index.milvus_index import check_milvus_readiness
+from src.eval.offline_eval import run_offline_eval
+from src.eval.feedback_export import export_feedback
+
+
 def _get_cache_ns() -> int:
     if _redis is not None:
         try:
@@ -8,6 +45,94 @@ def _get_cache_ns() -> int:
             return 1
         except Exception:
             pass
+
+def _tenant_ttl(tenant: str) -> int:
+    try:
+        cfg = (Config.SEMANTIC_CACHE_TTL_TENANT or "").strip()
+        if not cfg:
+            return int(Config.SEMANTIC_CACHE_TTL_SECONDS)
+        mapping = {}
+        for pair in [p.strip() for p in cfg.split(",") if p.strip()]:
+            k, v = pair.split(":", 1)
+            mapping[k.strip()] = int(v.strip())
+        return int(mapping.get(tenant, Config.SEMANTIC_CACHE_TTL_SECONDS))
+    except Exception:
+        return int(Config.SEMANTIC_CACHE_TTL_SECONDS)
+
+def _simhash(q: str, filters) -> str:
+    base = (q or "")
+    try:
+        f = filters.dict() if filters else {}
+    except Exception:
+        f = {}
+    s = base + "|" + json.dumps(f, sort_keys=True)
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]
+
+# Budget helpers (Redis-first with in-memory fallback)
+_budget_mem = {}
+
+def _budget_key(tenant: str) -> str:
+    return f"budget:{tenant}"
+
+def _budget_get(tenant: str):
+    try:
+        if _redis_usable():
+            try:
+                h = _redis.hgetall(_budget_key(tenant)) or {}
+                # decode if bytes
+                if isinstance(h, dict):
+                    h = {
+                        (k.decode() if isinstance(k, (bytes, bytearray)) else k):
+                        (v.decode() if isinstance(v, (bytes, bytearray)) else v)
+                        for k, v in h.items()
+                    }
+                limit = float(h.get("limit", Config.BUDGET_DEFAULT_DAILY_USD))
+                spent = float(h.get("spent", "0"))
+                window = int(h.get("window", str(int(time.time() // 86400))))
+                return (limit, spent, window)
+            except Exception:
+                _record_redis_failure()
+        m = _budget_mem.get(tenant, {"limit": Config.BUDGET_DEFAULT_DAILY_USD, "spent": 0.0, "window": int(time.time() // 86400)})
+        return (float(m["limit"]), float(m["spent"]), int(m["window"]))
+    except Exception:
+        return (Config.BUDGET_DEFAULT_DAILY_USD, 0.0, int(time.time() // 86400))
+
+def _budget_set(tenant: str, limit: float, spent: float, window: int):
+    try:
+        if _redis_usable():
+            try:
+                _redis.hset(_budget_key(tenant), mapping={"limit": limit, "spent": spent, "window": window})
+                return
+            except Exception:
+                _record_redis_failure()
+        _budget_mem[tenant] = {"limit": limit, "spent": spent, "window": window}
+    except Exception:
+        pass
+
+def _budget_add_spend(tenant: str, usd: float):
+    try:
+        limit, spent, window = _budget_get(tenant)
+        today = int(time.time() // 86400)
+        if window != today:
+            spent = 0.0
+            window = today
+        spent += max(0.0, float(usd))
+        _budget_set(tenant, limit, spent, window)
+    except Exception:
+        pass
+
+def _budget_should_throttle_and_model(tenant: str) -> tuple[bool, Optional[str]]:
+    try:
+        if not Config.BUDGET_ENABLED:
+            return (False, None)
+        limit, spent, _ = _budget_get(tenant)
+        if spent >= limit:
+            return (True, None)
+        if spent >= Config.BUDGET_WARN_FRACTION * limit:
+            return (False, Config.LLM_MODEL_CHEAP)
+        return (False, None)
+    except Exception:
+        return (False, None)
     return _cache_ns_mem
 
 def _bump_cache_ns() -> int:
@@ -178,11 +303,6 @@ ASK_RETRIES_TOTAL = Counter(
     "ask_retries_total",
     "Total LLM retries for /ask",
 )
-ASK_USAGE_TOTAL = Counter(
-    "ask_usage_total",
-    "Total /ask requests by tenant",
-    labelnames=["tenant"],
-)
 ASK_LLM_DURATION = Histogram(
     "ask_llm_duration_seconds",
     "Latency of LLM invocation in /ask",
@@ -204,37 +324,6 @@ OFFLINE_EVAL_ANS_SCORE_LAST = Gauge(
     "offline_eval_answer_contains_last",
     "Last offline eval answer contains score",
 )
-from fastapi import FastAPI
-from pydantic import BaseModel
-from starlette_exporter import PrometheusMiddleware, handle_metrics
-from src.app.deps import build_chain
-from src.eval.offline_eval import run_offline_eval
-import os
-from fastapi import HTTPException, Request
-from src.config import Config
-from src.index.milvus_index import check_milvus_readiness
-import time
-import uuid
-from datetime import datetime, timedelta
-import logging
-import json
-import jwt
-import redis
-import requests
-import hashlib
-from typing import Optional
-from opentelemetry import trace as ot_trace
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-import sentry_sdk
-from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
-from starlette.responses import StreamingResponse, PlainTextResponse, JSONResponse
-from prometheus_client import Counter, Gauge, Histogram
-import concurrent.futures
 
 app = FastAPI(
     title="Aerospace RAG API",
@@ -583,7 +672,7 @@ def _startup():
             READY = qa_chain is not None and milvus.get("connected") and milvus.get("has_collection") and milvus.get("loaded")
         else:
             READY = qa_chain is not None and faiss_path_exists
-    except Exception as e:
+    except Exception:
         # Do not crash on startup; mark as not ready
         READY = False
         qa_chain = None
@@ -828,6 +917,7 @@ def ask(req: AskReq, request: Request):
     delay = max(0.001, Config.RETRY_BASE_DELAY_MS / 1000.0)
     result = None
     # add tracing attributes
+    rerank_model_name = None
     try:
         if _tracer is not None:
             cur = ot_trace.get_current_span()
@@ -835,7 +925,7 @@ def ask(req: AskReq, request: Request):
             cur.set_attribute("llm.variant", llm_variant)
             cur.set_attribute("llm.model", model_name)
             cur.set_attribute("rerank.enabled", bool(rerank_enabled))
-            cur.set_attribute("rerank.model", rerank_model_name or "")
+            cur.set_attribute("rerank.model", "")
             cur.set_attribute("query.expanded", q_expanded != q)
             cur.set_attribute("request.id", getattr(getattr(request, "state", None), "request_id", ""))
     except Exception:
@@ -875,7 +965,7 @@ def ask(req: AskReq, request: Request):
                 continue
             else:
                 raise
-        except Exception as e:
+        except Exception:
             # other LLM failures
             attempt += 1
             try:
@@ -973,8 +1063,6 @@ def ask(req: AskReq, request: Request):
             texts = [getattr(d, "page_content", "") for d in docs]
             if texts:
                 from numpy import dot
-                from numpy.linalg import norm
-                import numpy as np
                 qv = model.encode([q], normalize_embeddings=True)[0]
                 dvs = model.encode(texts, normalize_embeddings=True)
                 scores = [float(dot(qv, dv)) for dv in dvs]
@@ -1288,6 +1376,19 @@ def admin_canary_rerank(request: Request, tenant: str):
         return rec
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post(
+    "/admin/feedback/export",
+    tags=["Admin"],
+    summary="Export recent feedback to JSONL and optionally upload to S3",
+)
+def admin_feedback_export(request: Request, limit: int = 1000, tenant: str | None = None, upload: bool = False):
+    require_admin(request)
+    try:
+        res = export_feedback(limit=limit, tenant=tenant, upload=upload)
+        return res
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

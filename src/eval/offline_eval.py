@@ -1,7 +1,8 @@
-import json, os, time
+import json
+import time
 from types import SimpleNamespace
 from typing import Dict, Any, List
-from prometheus_client import CollectorRegistry, Gauge, Counter, pushadd_to_gateway, REGISTRY
+from prometheus_client import Gauge, Counter, pushadd_to_gateway, REGISTRY
 from src.config import Config
 from src.app.deps import build_chain
 

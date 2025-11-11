@@ -40,8 +40,7 @@ class TimedRetriever:
                 elapsed = time.time() - start
                 VECTOR_SEARCH_DURATION.labels(self._backend_label).observe(elapsed)
                 return res
-            except Exception as e:
-                last_exc = e
+            except Exception:
                 attempt += 1
                 if attempt < Config.RETRY_MAX_ATTEMPTS:
                     VECTOR_SEARCH_RETRIES.labels(self._backend_label).inc()

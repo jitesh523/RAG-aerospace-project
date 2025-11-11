@@ -133,3 +133,6 @@ class Config:
     EVAL_PUSHGATEWAY_JOB = os.getenv("EVAL_PUSHGATEWAY_JOB", "offline-eval")
     CANARY_RERANK_WINDOW = int(os.getenv("CANARY_RERANK_WINDOW", "200"))
     CANARY_RERANK_MIN_HELPFUL = float(os.getenv("CANARY_RERANK_MIN_HELPFUL", "0.55"))
+    # Feedback export
+    EXPORT_S3_BUCKET = os.getenv("EXPORT_S3_BUCKET", "")
+    EXPORT_S3_PREFIX = os.getenv("EXPORT_S3_PREFIX", "exports/")
