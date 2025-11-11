@@ -64,6 +64,7 @@ class HybridRetriever:
         self._vs = vectorstore
         self._backend_label = backend_label
         self._search_kwargs = search_kwargs or {}
+        self.last_scores = None  # list of dicts: {doc_id, blended, v_sim, tf}
 
     def _tf_score(self, query: str, doc_text: str) -> float:
         q_terms = [t for t in (query or "").lower().split() if t]
@@ -104,9 +105,15 @@ class HybridRetriever:
                 for doc, v_sim, tf in sims:
                     tf_n = (tf / tf_max) if tf_max else 0.0
                     blended = alpha * v_sim + (1 - alpha) * tf_n
-                    ranked.append((blended, doc))
+                    ranked.append((blended, doc, v_sim, tf))
                 ranked.sort(key=lambda x: x[0], reverse=True)
-                top_docs = [d for _, d in ranked[: Config.RETRIEVER_K]]
+                top = ranked[: Config.RETRIEVER_K]
+                top_docs = [d for (blended, d, v_sim, tf) in top]
+                # capture explainability
+                self.last_scores = [
+                    {"doc_id": id(d), "blended": float(blended), "v_sim": float(v_sim), "tf": float(tf)}
+                    for (blended, d, v_sim, tf) in top
+                ]
                 elapsed = time.time() - start
                 VECTOR_SEARCH_DURATION.labels(self._backend_label).observe(elapsed)
                 return top_docs
@@ -174,7 +181,7 @@ def _faiss_filter_callable_from_filters(filters):
             return False
     return _pred
 
-def build_chain(filters=None):
+def build_chain(filters=None, llm_model: str | None = None, rerank_enabled: bool | None = None):
     if Config.MOCK_MODE:
         class _FakeChain:
             def invoke(self, q):
@@ -182,17 +189,23 @@ def build_chain(filters=None):
                 doc = SimpleNamespace(metadata={"source": "mock.pdf", "page": 1})
                 return {"result": f"mock answer: {q}", "source_documents": [doc]}
         return _FakeChain()
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=Config.OPENAI_API_KEY)
+    model = llm_model or "gpt-4o-mini"
+    llm = ChatOpenAI(model=model, temperature=0, api_key=Config.OPENAI_API_KEY)
     embeddings = OpenAIEmbeddings(model=Config.EMBED_MODEL, api_key=Config.OPENAI_API_KEY)
     backend = Config.RETRIEVER_BACKEND
     if backend == "milvus":
-        # Build Milvus-backed vector store retriever
-        vs = LC_Milvus(
-            embedding_function=embeddings,
-            collection_name=Config.MILVUS_COLLECTION,
-            connection_args={"host": Config.MILVUS_HOST, "port": str(Config.MILVUS_PORT)},
-            auto_id=False,
-        )
+        # Build Milvus-backed vector store retriever with fallback to FAISS
+        try:
+            vs = LC_Milvus(
+                embedding_function=embeddings,
+                collection_name=Config.MILVUS_COLLECTION,
+                connection_args={"host": Config.MILVUS_HOST, "port": str(Config.MILVUS_PORT)},
+                auto_id=False,
+            )
+        except Exception:
+            # Fallback: FAISS local store
+            vs = FAISS.load_local("./faiss_store", embeddings=embeddings)
+            backend = "faiss"
     else:
         # Default to FAISS
         vs = FAISS.load_local("./faiss_store", embeddings=embeddings)
@@ -203,6 +216,12 @@ def build_chain(filters=None):
         expr = _milvus_expr_from_filters(filters)
         if expr:
             search_kwargs["expr"] = expr
+        # If partitioning enabled and tenant provided, restrict to that partition
+        try:
+            if Config.MILVUS_PARTITIONED and getattr(filters, "tenant", None):
+                search_kwargs["partition_names"] = [str(filters.tenant)]
+        except Exception:
+            pass
     else:
         pred = _faiss_filter_callable_from_filters(filters)
         if pred:
@@ -213,4 +232,9 @@ def build_chain(filters=None):
     else:
         base_retriever = vs.as_retriever(search_type="mmr", search_kwargs=search_kwargs)
         retriever = TimedRetriever(base_retriever, backend_label=backend)
-    return RetrievalQA.from_chain_type(llm=llm, retriever=retriever, return_source_documents=True)
+    qa = RetrievalQA.from_chain_type(llm=llm, retriever=retriever, return_source_documents=True)
+    try:
+        setattr(qa, "_retriever_ref", retriever)
+    except Exception:
+        pass
+    return qa

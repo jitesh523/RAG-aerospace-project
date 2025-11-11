@@ -169,6 +169,29 @@ SEM_CACHE_MISSES_TOTAL = Counter(
     "/ask semantic cache misses",
     labelnames=["tenant"],
 )
+REQUEST_DURATION = Histogram(
+    "http_request_duration_seconds",
+    "Request latency by route",
+    labelnames=["method", "path"],
+)
+ASK_RETRIES_TOTAL = Counter(
+    "ask_retries_total",
+    "Total LLM retries for /ask",
+)
+ASK_USAGE_TOTAL = Counter(
+    "ask_usage_total",
+    "Total /ask requests by tenant",
+    labelnames=["tenant"],
+)
+ASK_LLM_DURATION = Histogram(
+    "ask_llm_duration_seconds",
+    "Latency of LLM invocation in /ask",
+)
+FEEDBACK_TOTAL = Counter(
+    "feedback_total",
+    "User feedback submissions",
+    labelnames=["tenant", "helpful"],
+)
 from fastapi import FastAPI
 from pydantic import BaseModel
 from starlette_exporter import PrometheusMiddleware, handle_metrics
@@ -196,8 +219,8 @@ import sentry_sdk
 from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from starlette.responses import StreamingResponse, PlainTextResponse
-from prometheus_client import Counter, Gauge
+from starlette.responses import StreamingResponse, PlainTextResponse, JSONResponse
+from prometheus_client import Counter, Gauge, Histogram
 import concurrent.futures
 
 app = FastAPI(
@@ -272,7 +295,8 @@ async def limit_request_size(request: Request, call_next):
         except Exception:
             pass
     return await call_next(request)
-if Config.METRICS_PUBLIC:
+# Metrics exposure policy: in non-local envs, require auth regardless of METRICS_PUBLIC
+if (Config.ENV == "local") and Config.METRICS_PUBLIC:
     app.add_route("/metrics", handle_metrics)
 else:
     @app.get("/metrics")
@@ -285,6 +309,7 @@ class AskFilters(BaseModel):
     doc_type: Optional[str] = None
     date_from: Optional[str] = None  # ISO date YYYY-MM-DD
     date_to: Optional[str] = None    # ISO date YYYY-MM-DD
+    tenant: Optional[str] = None
 
 class AskReq(BaseModel):
     query: str
@@ -308,6 +333,12 @@ class HealthResp(BaseModel):
 class ReadyResp(BaseModel):
     ready: bool
 
+class FeedbackReq(BaseModel):
+    query: str
+    answer: str
+    helpful: bool
+    clicked_sources: Optional[list[str]] = None
+
 qa_chain = None
 READY = False
 # cache of QA chains by (model, rerank_enabled)
@@ -316,6 +347,7 @@ _qa_cache = {}
 _ab_llm_mem = {}   # tenant -> 'A'|'B'
 _ab_rerank_mem = {}  # tenant -> 'true'|'false'
 _rerank_model = None
+_rerank_cache = {}
 _cb_failures = 0
 _cb_open_until = 0
 
@@ -338,8 +370,17 @@ if Config.REDIS_URL:
         _redis = redis.Redis.from_url(Config.REDIS_URL, decode_responses=True)
         # ping to verify connectivity
         _redis.ping()
+        _redis_cb_failures = 0
     except Exception:
         _redis = None
+        # open redis circuit on init failure
+        try:
+            _redis_cb_failures += 1
+            _redis_cb_open_until = int(time.time()) + max(1, Config.CB_RESET_SECONDS)
+            CIRCUIT_OPEN.labels(component="redis").inc()
+            CIRCUIT_STATE.labels(component="redis").set(1)
+        except Exception:
+            pass
     
 # Simple in-memory cache structure: key -> {v: response_json, t: epoch}
 _cache = {}
@@ -347,6 +388,8 @@ _cache = {}
 _sem_cache = {}
 # In-memory feedback buffer fallback (tenant -> list of dict)
 _feedback_mem = {}
+_audit_mem = []
+_budget_mem = {}
 
 # JWKS cache and verification helpers
 _jwks_cache = {"keys": None, "fetched_at": 0}
@@ -408,6 +451,59 @@ def _verify_jwt(token: str) -> bool:
     except Exception:
         return False
 
+def _expand_query(q: str) -> str:
+    try:
+        if not (Config.QUERY_EXPANSION_ENABLED and q):
+            return q
+        base = q
+        low = q.lower()
+        adds = []
+        if "uav" in low or "drone" in low:
+            adds.append("unmanned aerial vehicle")
+        if "gnc" in low:
+            adds.append("guidance navigation and control")
+        if "aero" in low:
+            adds.append("aerodynamics")
+        if not adds:
+            return q
+        return base + " " + " ".join(adds)
+    except Exception:
+        return q
+
+def _redact_pii(text: str) -> str:
+    if not (Config.PII_REDACTION_ENABLED and text):
+        return text
+    try:
+        import re
+        t = text
+        # emails
+        t = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[REDACTED_EMAIL]", t)
+        # phone-like
+        t = re.sub(r"\b(?:\+?\d[\s-]?){7,15}\b", "[REDACTED_PHONE]", t)
+        # passport/ids (very rough)
+        t = re.sub(r"\b[0-9A-Z]{8,}\b", "[REDACTED_ID]", t)
+        return t
+    except Exception:
+        return text
+
+def _redis_usable() -> bool:
+    try:
+        return _redis is not None and (time.time() >= _redis_cb_open_until)
+    except Exception:
+        return False
+
+def _record_redis_failure():
+    global _redis, _redis_cb_failures, _redis_cb_open_until
+    try:
+        _redis_cb_failures += 1
+        if _redis_cb_failures >= Config.CB_FAIL_THRESHOLD:
+            _redis = None
+            _redis_cb_open_until = int(time.time()) + max(1, Config.CB_RESET_SECONDS)
+            CIRCUIT_OPEN.labels(component="redis").inc()
+            CIRCUIT_STATE.labels(component="redis").set(1)
+    except Exception:
+        pass
+
 @app.middleware("http")
 async def add_request_id_and_logging(request: Request, call_next):
     req_id = str(uuid.uuid4())
@@ -433,6 +529,10 @@ async def add_request_id_and_logging(request: Request, call_next):
             "status_code": getattr(locals().get('response', None), 'status_code', None),
             "duration_ms": dur_ms,
         }))
+        try:
+            REQUEST_DURATION.labels(method=request.method, path=request.url.path).observe((time.time() - start))
+        except Exception:
+            pass
 
 @app.on_event("startup")
 def _startup():
@@ -453,6 +553,16 @@ def _startup():
                 except Exception:
                     attempt += 1
                     if attempt >= max(1, Config.RETRY_MAX_ATTEMPTS):
+                        # mark milvus circuit open
+                        try:
+                            global _milvus_cb_failures, _milvus_cb_open_until
+                            _milvus_cb_failures += 1
+                            if _milvus_cb_failures >= Config.CB_FAIL_THRESHOLD:
+                                _milvus_cb_open_until = int(time.time()) + max(1, Config.CB_RESET_SECONDS)
+                                CIRCUIT_OPEN.labels(component="milvus").inc()
+                                CIRCUIT_STATE.labels(component="milvus").set(1)
+                        except Exception:
+                            pass
                         raise
                     time.sleep(delay)
                     delay *= 2
@@ -463,6 +573,18 @@ def _startup():
         # Do not crash on startup; mark as not ready
         READY = False
         qa_chain = None
+    # Enforce auth configuration in non-local environments
+    try:
+        if Config.ENV != "local":
+            has_auth = bool(Config.API_KEY) or bool(Config.JWT_SECRET) or ((Config.JWT_ALG or "HS256").upper() == "RS256" and bool(Config.JWT_JWKS_URL))
+            if not has_auth:
+                READY = False
+                try:
+                    logger.error(json.dumps({"event": "startup_auth_check_failed", "reason": "non_local_requires_auth"}))
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 @app.post(
     "/ask",
@@ -472,6 +594,7 @@ def _startup():
     description="Returns an answer and source citations using the configured retriever and LLM.",
 )
 def ask(req: AskReq, request: Request):
+    global _cb_failures, _cb_open_until
     span_ctx = None
     if _tracer is not None:
         span_ctx = _tracer.start_as_current_span("ask")
@@ -483,7 +606,7 @@ def ask(req: AskReq, request: Request):
     key = api_key_hdr or (request.client.host if request.client else "unknown")
     now = int(time.time())
     window = now // 60
-    if _redis is not None:
+    if _redis_usable():
         rl_key = f"rl:{key}:{window}"
         try:
             newv = _redis.incr(rl_key)
@@ -493,6 +616,7 @@ def ask(req: AskReq, request: Request):
                 raise HTTPException(status_code=429, detail="Rate limit exceeded")
         except Exception:
             # Fallback to in-memory if redis error
+            _record_redis_failure()
             st = _rate_state.get(key)
             if not st or st["window"] != window:
                 st = {"window": window, "count": 0}
@@ -521,10 +645,28 @@ def ask(req: AskReq, request: Request):
         raise HTTPException(status_code=400, detail="Query must not be empty")
     if len(q) > 4000:
         raise HTTPException(status_code=400, detail="Query too long (max 4000 chars)")
+    # Optional query expansion to improve recall
+    q_expanded = _expand_query(q)
     if not READY or qa_chain is None:
         raise HTTPException(status_code=503, detail="Service not ready. Ingest documents to create ./faiss_store and restart.")
     # Determine AB routing for this tenant
     tenant_label = _tenant_from_key(api_key_hdr)
+    try:
+        ASK_USAGE_TOTAL.labels(tenant_label).inc()
+    except Exception:
+        pass
+    # Budget check and potential model downgrade
+    throttle, model_override = _budget_should_throttle_and_model(tenant_label)
+    if throttle:
+        raise HTTPException(status_code=429, detail="Tenant budget exceeded. Try later or increase budget.")
+    # Enforce server-side tenant isolation
+    try:
+        if Config.MULTITENANT_ENABLED:
+            if req.filters is None:
+                req.filters = AskFilters()
+            req.filters.tenant = tenant_label
+    except Exception:
+        pass
     def _get_llm_variant(t: str) -> str:
         # redis hash ab:llm maps tenant->'A'|'B'
         if _redis is not None:
@@ -548,6 +690,8 @@ def ask(req: AskReq, request: Request):
         return bool(Config.HYBRID_ENABLED)
     llm_variant = _get_llm_variant(tenant_label)
     model_name = Config.LLM_MODEL_A if llm_variant == "A" else Config.LLM_MODEL_B
+    if model_override:
+        model_name = model_override
     rerank_enabled = _get_rerank_enabled(tenant_label)
     # Build or reuse chain for this routing
     key_rt = (model_name, bool(rerank_enabled))
@@ -574,7 +718,7 @@ def ask(req: AskReq, request: Request):
             filt = {}
         ckey = f"ask:{ns}:{tenant_label}:{q}:{json.dumps(filt, sort_keys=True)}"
         nkey = f"{ckey}:neg"
-        if _redis is not None:
+        if _redis_usable():
             try:
                 # negative first
                 if Config.NEGATIVE_CACHE_ENABLED:
@@ -588,6 +732,7 @@ def ask(req: AskReq, request: Request):
                 else:
                     CACHE_MISSES_TOTAL.labels(tenant=tenant_label).inc()
             except Exception:
+                _record_redis_failure()
                 pass
         else:
             ent = _cache.get(ckey)
@@ -607,7 +752,7 @@ def ask(req: AskReq, request: Request):
     if Config.SEMANTIC_CACHE_ENABLED:
         simhash_key = _simhash(q, req.filters)
         skey = f"sem:{ns}:{tenant_label}:{simhash_key}"
-        if _redis is not None:
+        if _redis_usable():
             try:
                 cached = _redis.get(skey)
                 if cached:
@@ -616,6 +761,7 @@ def ask(req: AskReq, request: Request):
                 else:
                     SEM_CACHE_MISSES_TOTAL.labels(tenant=tenant_label).inc()
             except Exception:
+                _record_redis_failure()
                 pass
         else:
             ent = _sem_cache.get(skey)
@@ -625,16 +771,61 @@ def ask(req: AskReq, request: Request):
             else:
                 SEM_CACHE_MISSES_TOTAL.labels(tenant=tenant_label).inc()
 
-    # Circuit breaker: short-circuit if open
+    # Circuit breaker: short-circuit if open with graceful fallback
     now_ts = int(time.time())
     if _cb_open_until and now_ts < _cb_open_until:
         CIRCUIT_STATE.labels(component="llm").set(1)
-        raise HTTPException(status_code=503, detail="LLM unavailable (circuit open)")
+        try:
+            ns = _get_cache_ns()
+            try:
+                filt = req.filters.dict() if req.filters else {}
+            except Exception:
+                filt = {}
+            ckey = f"ask:{ns}:{tenant_label}:{q}:{json.dumps(filt, sort_keys=True)}"
+            skey = f"sem:{ns}:{tenant_label}:{_simhash(q, req.filters)}"
+            # Prefer semantic cache, then response cache
+            if _redis_usable():
+                try:
+                    cached = _redis.get(skey) or _redis.get(ckey)
+                    if cached:
+                        return json.loads(cached)
+                except Exception:
+                    _record_redis_failure()
+                    pass
+            ent = _sem_cache.get(skey)
+            if ent and (time.time() - ent.get("t", 0)) < Config.SEMANTIC_CACHE_TTL_SECONDS:
+                return ent.get("v", {"answer": "", "sources": []})
+            ent2 = _cache.get(ckey)
+            if ent2 and (time.time() - ent2.get("t", 0)) < Config.CACHE_TTL_SECONDS:
+                return ent2.get("v", {"answer": "", "sources": []})
+        except Exception:
+            pass
+        retry_after = max(1, int(_cb_open_until - now_ts)) if _cb_open_until else 10
+        payload = {
+            "answer": "Temporarily degraded: insufficient context. Please retry shortly.",
+            "sources": [],
+            "degraded": True,
+            "retry_after_seconds": retry_after,
+        }
+        return JSONResponse(content=payload, headers={"Retry-After": str(retry_after)})
 
     # LLM invocation with retry/backoff + timeout
     attempt = 0
     delay = max(0.001, Config.RETRY_BASE_DELAY_MS / 1000.0)
     result = None
+    # add tracing attributes
+    try:
+        if _tracer is not None:
+            cur = ot_trace.get_current_span()
+            cur.set_attribute("tenant", tenant_label)
+            cur.set_attribute("llm.variant", llm_variant)
+            cur.set_attribute("llm.model", model_name)
+            cur.set_attribute("rerank.enabled", bool(rerank_enabled))
+            cur.set_attribute("rerank.model", rerank_model_name or "")
+            cur.set_attribute("query.expanded", q_expanded != q)
+            cur.set_attribute("request.id", getattr(getattr(request, "state", None), "request_id", ""))
+    except Exception:
+        pass
     while True:
         try:
             if _tracer is not None:
@@ -642,53 +833,58 @@ def ask(req: AskReq, request: Request):
                 cur.set_attribute("query.length", len(q))
                 cur.set_attribute("retriever.backend", os.getenv("RETRIEVER_BACKEND", Config.RETRIEVER_BACKEND))
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                fut = ex.submit(chain.invoke, q)
+                llm_t0 = time.time()
+                fut = ex.submit(chain.invoke, q_expanded)
                 try:
                     result = fut.result(timeout=max(1, Config.LLM_TIMEOUT_SECONDS))
+                    try:
+                        ASK_LLM_DURATION.observe(time.time() - llm_t0)
+                    except Exception:
+                        pass
                 except concurrent.futures.TimeoutError:
-                    ASK_TIMEOUTS.inc()
-                    # record failure for CB
-                    global _cb_failures, _cb_open_until
+                    # timeout acts as a failure for CB
                     _cb_failures += 1
                     if _cb_failures >= Config.CB_FAIL_THRESHOLD:
-                        _cb_open_until = int(time.time()) + max(1, Config.CB_RESET_SECONDS)
-                        CIRCUIT_OPEN.labels(component="llm").inc()
-                        CIRCUIT_STATE.labels(component="llm").set(1)
+                        _cb_open_until = time.time() + Config.CB_RESET_SECONDS
                     raise HTTPException(status_code=504, detail="LLM timeout")
-            break
         except HTTPException:
-            # propagate HTTP errors like timeout
-            raise
-        except Exception:
+            # surfaced timeout
             attempt += 1
-            if attempt >= max(1, Config.RETRY_MAX_ATTEMPTS):
-                if span_ctx is not None:
-                    span_ctx.__exit__(None, None, None)
-                # record failure for CB
-                _cb_failures += 1
-                if _cb_failures >= Config.CB_FAIL_THRESHOLD:
-                    _cb_open_until = int(time.time()) + max(1, Config.CB_RESET_SECONDS)
-                    CIRCUIT_OPEN.labels(component="llm").inc()
-                    CIRCUIT_STATE.labels(component="llm").set(1)
+            try:
+                if attempt < Config.RETRY_MAX_ATTEMPTS:
+                    ASK_RETRIES_TOTAL.inc()
+            except Exception:
+                pass
+            if attempt < Config.RETRY_MAX_ATTEMPTS:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            else:
                 raise
-            ASK_RETRIES.inc()
-            time.sleep(delay)
-            delay *= 2
-    # CB success path: reset failures when success
-    _cb_failures = 0
-    _cb_open_until = 0
-    CIRCUIT_STATE.labels(component="llm").set(0)
-    if span_ctx is not None:
-        span_ctx.__exit__(None, None, None)
-    docs = result["source_documents"]
-    # Exclude soft-deleted sources (denylist)
+        except Exception as e:
+            # other LLM failures
+            attempt += 1
+            try:
+                if attempt < Config.RETRY_MAX_ATTEMPTS:
+                    ASK_RETRIES_TOTAL.inc()
+            except Exception:
+                pass
+            if attempt < Config.RETRY_MAX_ATTEMPTS:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            else:
+                raise
+        else:
+            break
     try:
         deny = set()
-        if _redis is not None:
+        if _redis_usable():
             try:
                 members = _redis.smembers("deny:sources")
                 deny = set([m.decode("utf-8") if isinstance(m, (bytes, bytearray)) else str(m) for m in members])
             except Exception:
+                _record_redis_failure()
                 deny = set(_deny_sources_mem)
         else:
             deny = set(_deny_sources_mem)
@@ -729,20 +925,44 @@ def ask(req: AskReq, request: Request):
         except Exception:
             pass
     # Reranking: ML model if configured, else TF-based if enabled
-    if Config.RERANK_MODEL:
+    # Determine rerank model variant (A/B) per-tenant if configured
+    rerank_model_name = Config.RERANK_MODEL
+    if Config.RERANK_MODEL_A or Config.RERANK_MODEL_B:
+        def _get_rerank_variant(t: str) -> str:
+            if _redis_usable():
+                try:
+                    v = _redis.hget("ab:rerank_model", t)
+                    if v in ("A", "B"):
+                        return v
+                except Exception:
+                    _record_redis_failure()
+                    pass
+            return (_ab_rerank_mem.get(f"model:{t}") or "A")
+        v = _get_rerank_variant(tenant_label)
+        if v == "B" and Config.RERANK_MODEL_B:
+            rerank_model_name = Config.RERANK_MODEL_B
+        elif Config.RERANK_MODEL_A:
+            rerank_model_name = Config.RERANK_MODEL_A
+
+    if rerank_model_name:
         global _rerank_model
         try:
-            if _rerank_model is None:
+            # cache reranker instances per model name
+            model = _rerank_cache.get(rerank_model_name)
+            if model is None:
                 from sentence_transformers import SentenceTransformer
-                _rerank_model = SentenceTransformer(Config.RERANK_MODEL)
+                model = SentenceTransformer(rerank_model_name)
+                _rerank_cache[rerank_model_name] = model
             # encode query and docs, rank by cosine similarity
+            # cost guardrail: cap reranked documents
+            docs = docs[: max(1, Config.RERANK_MAX_DOCS)]
             texts = [getattr(d, "page_content", "") for d in docs]
             if texts:
                 from numpy import dot
                 from numpy.linalg import norm
                 import numpy as np
-                qv = _rerank_model.encode([q], normalize_embeddings=True)[0]
-                dvs = _rerank_model.encode(texts, normalize_embeddings=True)
+                qv = model.encode([q], normalize_embeddings=True)[0]
+                dvs = model.encode(texts, normalize_embeddings=True)
                 scores = [float(dot(qv, dv)) for dv in dvs]
                 pairs = list(zip(scores, docs))
                 pairs.sort(key=lambda x: x[0], reverse=True)
@@ -756,7 +976,7 @@ def ask(req: AskReq, request: Request):
             text = getattr(doc, "page_content", "").lower()
             return sum(text.count(t) for t in q_terms)
         try:
-            docs = sorted(docs, key=_score, reverse=True)
+            docs = sorted(docs[: max(1, Config.RERANK_MAX_DOCS)], key=_score, reverse=True)
         except Exception:
             pass
     sources = [
@@ -766,7 +986,58 @@ def ask(req: AskReq, request: Request):
         }
         for d in docs
     ]
-    resp = {"answer": result["result"], "sources": sources}
+    # PII redaction on answer if enabled
+    safe_answer = _redact_pii(result.get("result", ""))
+    resp = {"answer": safe_answer, "sources": sources}
+    # Explainability: include previews and scores if enabled
+    if Config.EXPLAIN_ENABLED:
+        try:
+            previews = []
+            max_chars = max(0, int(Config.EXPLAIN_PREVIEW_CHARS))
+            for d in docs:
+                txt = getattr(d, "page_content", "") or ""
+                previews.append(txt[:max_chars])
+            scores = None
+            try:
+                retr = getattr(chain, "_retriever_ref", None)
+                if retr is not None and hasattr(retr, "last_scores") and retr.last_scores:
+                    scores = retr.last_scores
+            except Exception:
+                scores = None
+            explain = []
+            for i, s in enumerate(sources):
+                item = {"source": s.get("source", ""), "page": s.get("page"), "preview": previews[i] if i < len(previews) else ""}
+                if scores and i < len(scores):
+                    sc = scores[i]
+                    item.update({"score": sc.get("blended"), "v_sim": sc.get("v_sim"), "tf": sc.get("tf")})
+                explain.append(item)
+            resp["explain"] = explain
+        except Exception:
+            pass
+    # Export payload (markdown or json) with citations
+    if Config.EXPORT_ENABLED:
+        try:
+            fmt = (Config.EXPORT_FORMAT or "markdown").lower()
+            if fmt == "markdown":
+                lines = [safe_answer, "", "References:"]
+                for i, s in enumerate(sources, start=1):
+                    src = s.get("source", "")
+                    pg = s.get("page")
+                    ref = f"{i}. {src}"
+                    if pg is not None:
+                        ref += f" (p.{pg})"
+                    lines.append(ref)
+                resp["export"] = {"format": "markdown", "content": "\n".join(lines)}
+            else:
+                resp["export"] = {
+                    "format": "json",
+                    "content": {
+                        "answer": safe_answer,
+                        "citations": [{"source": s.get("source", ""), "page": s.get("page")} for s in sources],
+                    },
+                }
+        except Exception:
+            pass
     # Cost and token estimation metrics
     if Config.COST_ENABLED:
         try:
@@ -789,7 +1060,7 @@ def ask(req: AskReq, request: Request):
         ns = _get_cache_ns()
         ckey = f"ask:{ns}:{tenant_label}:{q}:{json.dumps(filt, sort_keys=True)}"
         nkey = f"{ckey}:neg"
-        if _redis is not None:
+        if _redis_usable():
             try:
                 # negative caching for empty answers
                 if Config.NEGATIVE_CACHE_ENABLED and ((not resp.get("answer")) or (not resp.get("sources"))):
@@ -797,6 +1068,7 @@ def ask(req: AskReq, request: Request):
                 else:
                     _redis.setex(ckey, Config.CACHE_TTL_SECONDS, json.dumps(resp))
             except Exception:
+                _record_redis_failure()
                 pass
         else:
             # negative caching in memory
@@ -808,14 +1080,79 @@ def ask(req: AskReq, request: Request):
     if Config.SEMANTIC_CACHE_ENABLED:
         simhash_key = _simhash(q, req.filters)
         skey = f"sem:{ns}:{tenant_label}:{simhash_key}"
-        if _redis is not None:
+        if _redis_usable():
             try:
-                _redis.setex(skey, Config.SEMANTIC_CACHE_TTL_SECONDS, json.dumps(resp))
+                _redis.setex(skey, _tenant_ttl(tenant_label), json.dumps(resp))
             except Exception:
+                _record_redis_failure()
                 pass
         else:
             _sem_cache[skey] = {"v": resp, "t": time.time()}
+    # Audit logging (Redis-first, fallback memory)
+    try:
+        if Config.AUDIT_ENABLED:
+            audit = {
+                "ts": int(time.time()),
+                "tenant": tenant_label,
+                "query_len": len(q),
+                "answer_len": len(resp.get("answer", "")),
+                "sources": [s.get("source", "") for s in sources],
+                "request_id": getattr(getattr(request, "state", None), "request_id", ""),
+            }
+            if _redis_usable():
+                try:
+                    _redis.rpush("audit:ask", json.dumps(audit))
+                except Exception:
+                    _record_redis_failure()
+                    _audit_mem.append(audit)
+            else:
+                _audit_mem.append(audit)
+    except Exception:
+        pass
+    # Update budget with cost (if computed)
+    try:
+        if Config.BUDGET_ENABLED and Config.COST_ENABLED:
+            # very rough token estimate is already computed above
+            # cost variable is computed in cost block; recompute safely if absent
+            if 'cost' not in locals():
+                p_tokens = max(1, int(len(q) / 4))
+                c_tokens = max(1, int(len(resp.get("answer", "")) / 4))
+                cost = (p_tokens / 1000.0) * Config.COST_PER_1K_PROMPT_TOKENS + (c_tokens / 1000.0) * Config.COST_PER_1K_COMPLETION_TOKENS
+            _budget_add_spend(tenant_label, float(cost))
+    except Exception:
+        pass
     return resp
+
+@app.post(
+    "/feedback",
+    tags=["Feedback"],
+    summary="Submit user feedback",
+)
+def submit_feedback(req: FeedbackReq, request: Request):
+    require_auth(request)
+    tenant = _tenant_from_key(request.headers.get("x-api-key"))
+    item = {
+        "ts": int(time.time()),
+        "tenant": tenant,
+        "query": req.query,
+        "answer": req.answer,
+        "helpful": bool(req.helpful),
+        "clicked_sources": req.clicked_sources or [],
+        "request_id": getattr(getattr(request, "state", None), "request_id", ""),
+    }
+    FEEDBACK_TOTAL.labels(tenant=tenant, helpful=str(bool(req.helpful)).lower()).inc()
+    # Try Redis list first, fallback to in-memory buffer
+    if _redis_usable():
+        try:
+            _redis.rpush(f"feedback:{tenant}", json.dumps(item))
+            return {"ok": True}
+        except Exception:
+            _record_redis_failure()
+            pass
+    buf = _feedback_mem.get(tenant) or []
+    buf.append(item)
+    _feedback_mem[tenant] = buf
+    return {"ok": True}
 
 # SSE streaming endpoint (flag-gated)
 @app.get("/ask/stream")
@@ -828,7 +1165,7 @@ def ask_stream(query: str, request: Request):
     key = request.headers.get("x-api-key") or (request.client.host if request.client else "unknown")
     now = int(time.time())
     window = now // 60
-    if _redis is not None:
+    if _redis_usable():
         rl_key = f"rl:{key}:{window}"
         try:
             newv = _redis.incr(rl_key)
@@ -837,6 +1174,7 @@ def ask_stream(query: str, request: Request):
             if newv > Config.RATE_LIMIT_PER_MIN:
                 raise HTTPException(status_code=429, detail="Rate limit exceeded")
         except Exception:
+            _record_redis_failure()
             st = _rate_state.get(key)
             if not st or st["window"] != window:
                 st = {"window": window, "count": 0}
