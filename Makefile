@@ -17,6 +17,12 @@ test:
 ingest:
 	$(PY) src/ingest/ingest.py --input $(INPUT_DIR) --batch_size 200
 
+ingest_async:
+	$(PY) src/ingest/producer.py --input $(INPUT_DIR)
+
+worker:
+	$(PY) src/ingest/worker.py
+
 eval:
 	$(PY) src/eval/evaluate.py --questions ./data/eval/questions.json
 
