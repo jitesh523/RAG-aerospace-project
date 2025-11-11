@@ -1,0 +1,98 @@
+import json, os, time
+from types import SimpleNamespace
+from typing import Dict, Any, List
+from prometheus_client import CollectorRegistry, Gauge, Counter, pushadd_to_gateway, REGISTRY
+from src.config import Config
+from src.app.deps import build_chain
+
+# Offline evaluation over a golden set
+# Golden JSONL schema per line: {"tenant": "t1", "query": "...", "expected_sources": ["foo.pdf"], "expected_answer_contains": ["term1", "term2"]}
+
+def _load_golden(path: str) -> List[Dict[str, Any]]:
+    items = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    items.append(obj)
+                except Exception:
+                    continue
+    except FileNotFoundError:
+        return []
+    return items
+
+
+def _make_filters(tenant: str):
+    # Minimal filters object compatible with deps._milvus_expr_from_filters/_faiss_filter
+    return SimpleNamespace(tenant=tenant)
+
+
+def run_offline_eval(golden_path: str | None = None) -> Dict[str, Any]:
+    path = golden_path or Config.EVAL_GOLDEN_PATH
+    data = _load_golden(path)
+    if not data:
+        return {"ok": False, "reason": f"no golden data at {path}"}
+    total = len(data)
+    hits = 0
+    answer_scores = 0.0
+    per = []
+    for item in data:
+        t = str(item.get("tenant", "")).strip() or "__default__"
+        q = str(item.get("query", ""))
+        exp_sources = list(item.get("expected_sources", []) or [])
+        exp_ans_parts = list(item.get("expected_answer_contains", []) or [])
+        try:
+            chain = build_chain(filters=_make_filters(t))
+            res = chain.invoke(q)
+            ans = res.get("result", "") or ""
+            docs = res.get("source_documents", []) or []
+            got_sources = [getattr(d, "metadata", {}).get("source", "") for d in docs]
+            # retrieval hit
+            hit = 1 if (set(exp_sources) & set(got_sources)) else 0
+            hits += hit
+            # answer contain score
+            score = 0.0
+            if exp_ans_parts:
+                score = sum(1 for p in exp_ans_parts if p and (p.lower() in ans.lower())) / float(len(exp_ans_parts))
+            answer_scores += score
+            per.append({
+                "tenant": t,
+                "query": q,
+                "hit": hit,
+                "answer_score": score,
+                "got_sources": got_sources,
+            })
+        except Exception as e:
+            per.append({"tenant": t, "query": q, "error": str(e)})
+            continue
+    recall = hits / float(total) if total else 0.0
+    avg_answer = answer_scores / float(total) if total else 0.0
+    out = {
+        "ok": True,
+        "total": total,
+        "recall_at_k": recall,
+        "avg_answer_contains": avg_answer,
+        "ts": int(time.time()),
+        "details": per[:50],  # cap preview
+    }
+    # Optionally push summary to Pushgateway
+    if Config.PUSHGATEWAY_URL:
+        try:
+            g_recall = Gauge("offline_eval_recall", "Offline eval recall@k", registry=REGISTRY)
+            g_ans = Gauge("offline_eval_answer_contains", "Offline eval answer contains score", registry=REGISTRY)
+            c_runs = Counter("offline_eval_runs_total", "Offline eval runs", registry=REGISTRY)
+            g_recall.set(recall)
+            g_ans.set(avg_answer)
+            c_runs.inc()
+            pushadd_to_gateway(Config.PUSHGATEWAY_URL, job=Config.EVAL_PUSHGATEWAY_JOB, registry=REGISTRY)
+        except Exception:
+            pass
+    return out
+
+if __name__ == "__main__":
+    res = run_offline_eval()
+    print(json.dumps(res, indent=2))

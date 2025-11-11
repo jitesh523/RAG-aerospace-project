@@ -192,10 +192,23 @@ FEEDBACK_TOTAL = Counter(
     "User feedback submissions",
     labelnames=["tenant", "helpful"],
 )
+OFFLINE_EVAL_RUNS_TOTAL = Counter(
+    "offline_eval_runs_total",
+    "Offline eval runs triggered",
+)
+OFFLINE_EVAL_RECALL_LAST = Gauge(
+    "offline_eval_recall_last",
+    "Last offline eval recall@k",
+)
+OFFLINE_EVAL_ANS_SCORE_LAST = Gauge(
+    "offline_eval_answer_contains_last",
+    "Last offline eval answer contains score",
+)
 from fastapi import FastAPI
 from pydantic import BaseModel
 from starlette_exporter import PrometheusMiddleware, handle_metrics
 from src.app.deps import build_chain
+from src.eval.offline_eval import run_offline_eval
 import os
 from fastapi import HTTPException, Request
 from src.config import Config
@@ -390,6 +403,7 @@ _sem_cache = {}
 _feedback_mem = {}
 _audit_mem = []
 _budget_mem = {}
+_eval_mem = []
 
 # JWKS cache and verification helpers
 _jwks_cache = {"keys": None, "fetched_at": 0}
@@ -1159,8 +1173,14 @@ def list_filters(request: Request):
         try:
             s_key = f"filt:{tenant}:sources"
             d_key = f"filt:{tenant}:doc_types"
-            res["sources"] = sorted([m.decode("utf-8") if isinstance(m, (bytes, bytearray)) else str(m) for m in (_redis.smembers(s_key) or set()) if str(m)])
-            res["doc_types"] = sorted([m.decode("utf-8") if isinstance(m, (bytes, bytearray)) else str(m) for m in (_redis.smembers(d_key) or set()) if str(m)])
+            res["sources"] = sorted([
+                m.decode("utf-8") if isinstance(m, (bytes, bytearray)) else str(m)
+                for m in (_redis.smembers(s_key) or set()) if str(m)
+            ])
+            res["doc_types"] = sorted([
+                m.decode("utf-8") if isinstance(m, (bytes, bytearray)) else str(m)
+                for m in (_redis.smembers(d_key) or set()) if str(m)
+            ])
             res["date_min"] = _redis.get(f"filt:{tenant}:date_min")
             res["date_max"] = _redis.get(f"filt:{tenant}:date_max")
             return res
@@ -1168,6 +1188,108 @@ def list_filters(request: Request):
             _record_redis_failure()
             return res
     return res
+
+@app.post(
+    "/admin/eval/run",
+    tags=["Admin"],
+    summary="Run offline evaluation over golden set",
+)
+def admin_eval_run(request: Request):
+    require_admin(request)
+    res = run_offline_eval()
+    try:
+        if res.get("ok"):
+            OFFLINE_EVAL_RUNS_TOTAL.inc()
+            OFFLINE_EVAL_RECALL_LAST.set(float(res.get("recall_at_k", 0.0)))
+            OFFLINE_EVAL_ANS_SCORE_LAST.set(float(res.get("avg_answer_contains", 0.0)))
+        payload = json.dumps(res)
+        if _redis_usable():
+            try:
+                _redis.rpush("eval:history", payload)
+            except Exception:
+                _record_redis_failure()
+                _eval_mem.append(res)
+        else:
+            _eval_mem.append(res)
+    except Exception:
+        pass
+    return res
+
+@app.get(
+    "/admin/eval/history",
+    tags=["Admin"],
+    summary="List recent offline eval results",
+)
+def admin_eval_history(request: Request, limit: int = 20):
+    require_admin(request)
+    out = []
+    if _redis_usable():
+        try:
+            arr = _redis.lrange("eval:history", -limit, -1) or []
+            out = [json.loads(x) for x in arr]
+        except Exception:
+            _record_redis_failure()
+            out = _eval_mem[-limit:]
+    else:
+        out = _eval_mem[-limit:]
+    return {"items": out}
+
+# Phase 8: Canary rerank application based on recent feedback helpful rate
+@app.post(
+    "/admin/canary/rerank/apply",
+    tags=["Admin"],
+    summary="Apply canary reranker enable/disable per tenant based on helpful rate",
+)
+def admin_canary_rerank(request: Request, tenant: str):
+    require_admin(request)
+    t = (tenant or "").strip()
+    if not t:
+        raise HTTPException(status_code=400, detail="tenant required")
+    window = max(10, int(Config.CANARY_RERANK_WINDOW))
+    helpful_rate = None
+    try:
+        items = []
+        if _redis_usable():
+            try:
+                raw = _redis.lrange("feedback", -2000, -1) or []
+                for r in raw[::-1]:
+                    try:
+                        obj = json.loads(r)
+                        if obj.get("tenant") == t:
+                            items.append(obj)
+                            if len(items) >= window:
+                                break
+                    except Exception:
+                        continue
+            except Exception:
+                _record_redis_failure()
+        else:
+            items = _feedback_mem.get(t, [])[-window:]
+        if not items:
+            raise HTTPException(status_code=400, detail="no feedback available for tenant")
+        pos = sum(1 for x in items if bool(x.get("helpful")))
+        helpful_rate = pos / float(len(items))
+        enable = helpful_rate >= float(Config.CANARY_RERANK_MIN_HELPFUL)
+        # write routing
+        if _redis_usable():
+            try:
+                _redis.hset("ab:rerank", t, "true" if enable else "false")
+            except Exception:
+                _ab_rerank_mem[t] = "true" if enable else "false"
+        else:
+            _ab_rerank_mem[t] = "true" if enable else "false"
+        # record history
+        rec = {"tenant": t, "enable": enable, "helpful_rate": helpful_rate, "count": len(items), "ts": int(time.time())}
+        if _redis_usable():
+            try:
+                _redis.rpush("canary:rerank:history", json.dumps(rec))
+            except Exception:
+                _record_redis_failure()
+        return rec
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # SSE streaming endpoint (flag-gated)
 @app.get("/ask/stream")
