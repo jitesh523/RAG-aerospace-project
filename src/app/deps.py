@@ -6,6 +6,8 @@ from src.config import Config
 from prometheus_client import Histogram, Counter
 import redis as _redis_mod
 import time
+from typing import List, Tuple, Dict, Any
+from src.retrieval.hybrid_v2 import BM25Adapter, blend_candidates
 
 
 # Prometheus histogram for vector search latency
@@ -245,7 +247,84 @@ def build_chain(filters=None, llm_model: str | None = None, rerank_enabled: bool
         if pred:
             search_kwargs["filter"] = pred
 
-    if Config.HYBRID_ENABLED:
+    if Config.HYBRID_V2_ENABLED:
+        # Wrap the base retriever and blend dense vectors with BM25 over candidate texts
+        class HybridV2Retriever:
+            def __init__(self, inner, backend_label: str, search_kwargs: dict):
+                self._inner = inner
+                self._backend_label = backend_label
+                self._search_kwargs = dict(search_kwargs)
+                self.last_blend = None
+
+            def get_relevant_documents(self, query: str):
+                start = time.time()
+                attempt = 0
+                delay = max(0.001, Config.RETRY_BASE_DELAY_MS / 1000.0)
+                while attempt < max(1, Config.RETRY_MAX_ATTEMPTS):
+                    try:
+                        fetch_k = max(Config.RETRIEVER_FETCH_K, Config.RETRIEVER_K)
+                        pairs = self._inner.similarity_search_with_score(query, k=fetch_k, **self._search_kwargs)
+                        if not pairs:
+                            VECTOR_SEARCH_DURATION.labels(self._backend_label).observe(time.time() - start)
+                            return []
+                        # Prepare candidate corpus for BM25
+                        cand_texts: List[str] = [getattr(d, "page_content", "") for (d, _) in pairs]
+                        cand_meta: List[Dict[str, Any]] = [getattr(d, "metadata", {}) for (d, _) in pairs]
+                        # Dense scores (convert distances to similarity in [0,1])
+                        dists = [s for (_, s) in pairs]
+                        dmin, dmax = min(dists), max(dists)
+                        dense = []
+                        for (doc, dist) in pairs:
+                            if dmax == dmin:
+                                sim = 1.0
+                            else:
+                                sim = (dmax - dist) / (dmax - dmin)
+                            dense.append((float(sim), getattr(doc, "metadata", {})))
+                        # BM25 over candidates
+                        bm25 = []
+                        try:
+                            adapter = BM25Adapter(cand_texts, cand_meta)
+                            bm25 = adapter.search(query, k=fetch_k)
+                        except Exception:
+                            bm25 = []
+                        # Weights: Redis override or Config defaults
+                        weights = {"dense": Config.HYBRID_V2_DENSE_WEIGHT, "bm25": Config.HYBRID_V2_BM25_WEIGHT}
+                        try:
+                            if Config.REDIS_URL:
+                                r = _redis_mod.Redis.from_url(Config.REDIS_URL, decode_responses=True)
+                                rd = r.hgetall("retrieval:weights") or {}
+                                if "dense" in rd: weights["dense"] = float(rd["dense"]) 
+                                if "bm25" in rd: weights["bm25"] = float(rd["bm25"]) 
+                        except Exception:
+                            pass
+                        blended = blend_candidates(dense, bm25, weights=weights, k=Config.RETRIEVER_K)
+                        # Map back to documents matching metadata source+page
+                        def _key(md):
+                            return f"{str(md.get('source',''))}#{str(md.get('page',''))}"
+                        docmap = {_key(getattr(d, 'metadata', {})): d for (d, _) in pairs}
+                        out_docs = []
+                        for _, md in blended:
+                            k = _key(md)
+                            if k in docmap:
+                                out_docs.append(docmap[k])
+                            if len(out_docs) >= Config.RETRIEVER_K:
+                                break
+                        self.last_blend = blended
+                        VECTOR_SEARCH_DURATION.labels(self._backend_label).observe(time.time() - start)
+                        return out_docs
+                    except Exception:
+                        attempt += 1
+                        if attempt < Config.RETRY_MAX_ATTEMPTS:
+                            VECTOR_SEARCH_RETRIES.labels(self._backend_label).inc()
+                            time.sleep(delay)
+                            delay *= 2
+                        else:
+                            VECTOR_SEARCH_DURATION.labels(self._backend_label).observe(time.time() - start)
+                            raise
+
+        base_retriever = vs  # vectorstore instance
+        retriever = HybridV2Retriever(base_retriever, backend_label=backend, search_kwargs=search_kwargs)
+    elif Config.HYBRID_ENABLED:
         retriever = HybridRetriever(vs, backend_label=backend, search_kwargs=search_kwargs)
     else:
         base_retriever = vs.as_retriever(search_type="mmr", search_kwargs=search_kwargs)

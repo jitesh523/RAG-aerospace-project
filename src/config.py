@@ -153,3 +153,8 @@ class Config:
     MILVUS_COLLECTION_SECONDARY = os.getenv("MILVUS_COLLECTION_SECONDARY", MILVUS_COLLECTION)
     DR_DUAL_WRITE = os.getenv("DR_DUAL_WRITE", "true").lower() == "true"
     DR_READ_PREFERRED = os.getenv("DR_READ_PREFERRED", "primary")  # primary|secondary
+
+    # Phase 12: Advanced Retrieval v2
+    HYBRID_V2_ENABLED = os.getenv("HYBRID_V2_ENABLED", "true").lower() == "true"
+    HYBRID_V2_DENSE_WEIGHT = float(os.getenv("HYBRID_V2_DENSE_WEIGHT", "0.6"))
+    HYBRID_V2_BM25_WEIGHT = float(os.getenv("HYBRID_V2_BM25_WEIGHT", "0.4"))
