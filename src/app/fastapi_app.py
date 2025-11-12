@@ -1,3 +1,19 @@
+def _has_scope(request: Request, needle: str) -> bool:
+    try:
+        authz = request.headers.get("authorization", "")
+        if not authz.lower().startswith("bearer "):
+            return False
+        token = authz.split(" ", 1)[1]
+        claims = jwt.decode(token, options={"verify_signature": False}, algorithms=["RS256", "HS256"])
+        scopes = claims.get("scope") or claims.get("scopes") or claims.get("scp") or []
+        if isinstance(scopes, str):
+            scopes = scopes.split()
+        roles = claims.get("roles") or []
+        if isinstance(roles, str):
+            roles = [roles]
+        return (needle in scopes) or (needle in roles)
+    except Exception:
+        return False
 import os
 import time
 import uuid
@@ -35,6 +51,7 @@ from src.index.milvus_index import check_milvus_readiness
 from src.eval.offline_eval import run_offline_eval
 from src.eval.feedback_export import export_feedback
 from src.eval.online_eval import run_shadow_eval
+from src.policy.engine import evaluate_pre as policy_eval_pre, evaluate_post as policy_eval_post, load_policy
 
 
 def _get_cache_ns() -> int:
@@ -47,6 +64,34 @@ def _get_cache_ns() -> int:
             return 1
         except Exception:
             pass
+
+# ---- Phase 11: Policy admin endpoints ----
+@app.post("/admin/policy/set", tags=["Admin"])
+def admin_policy_set(request: Request, tenant: str, body: dict):
+    require_admin(request)
+    if not tenant:
+        raise HTTPException(status_code=400, detail="tenant required")
+    if _redis_usable():
+        try:
+            _redis.set(f"policy:{tenant}", json.dumps(body))
+        except Exception:
+            _record_redis_failure()
+            raise HTTPException(status_code=500, detail="redis error")
+    return {"ok": True}
+
+@app.get("/admin/policy/get", tags=["Admin"])
+def admin_policy_get(request: Request, tenant: str):
+    require_admin(request)
+    pol = load_policy(_redis if _redis_usable() else None, tenant)
+    return {"ok": True, "policy": pol}
+
+@app.post("/admin/policy/test", tags=["Admin"])
+def admin_policy_test(request: Request, tenant: str, body: dict):
+    require_admin(request)
+    pol = load_policy(_redis if _redis_usable() else None, tenant)
+    filt, decision = policy_eval_pre(body or {}, pol)
+    ans, srcs, post_dec = policy_eval_post(body.get("answer", ""), body.get("sources", []) or [], pol, override=bool(body.get("override", False)))
+    return {"ok": True, "pre": {"filters": filt, "decision": decision}, "post": {"answer": ans, "sources": srcs, "decision": post_dec}}
 
 # ---- Phase 9: Online eval runtime config helpers ----
 def _online_eval_cfg() -> dict:
@@ -894,6 +939,33 @@ def ask(req: AskReq, request: Request):
             req.filters.tenant = tenant_label
     except Exception:
         pass
+    # Phase 11: Policy-aware pre-eval to derive additional filters/deny
+    try:
+        pol = load_policy(_redis if _redis_usable() else None, tenant_label)
+        qctx = {
+            "tenant": tenant_label,
+            "doc_type": getattr(req.filters, "doc_type", None) if req.filters else None,
+            "region": None,
+        }
+        add_filters, decision = policy_eval_pre(qctx, pol)
+        if decision.get("deny"):
+            try:
+                logger.info(json.dumps({"event": "policy_deny", "tenant": tenant_label, "request_id": getattr(getattr(request, "state", None), "request_id", "")}))
+            except Exception:
+                pass
+            raise HTTPException(status_code=403, detail="Policy denied the request")
+        # merge filter hints
+        if add_filters:
+            if req.filters is None:
+                req.filters = AskFilters()
+            if add_filters.get("sources"):
+                req.filters.sources = list(add_filters.get("sources"))
+            if add_filters.get("doc_type"):
+                req.filters.doc_type = str(add_filters.get("doc_type"))
+    except HTTPException:
+        raise
+    except Exception:
+        pass
     def _get_llm_variant(t: str) -> str:
         # redis hash ab:llm maps tenant->'A'|'B'
         if _redis is not None:
@@ -1218,9 +1290,15 @@ def ask(req: AskReq, request: Request):
         }
         for d in docs
     ]
-    # PII redaction on answer if enabled
+    # PII redaction and policy enforcement on answer
     safe_answer = _redact_pii(result.get("result", ""))
-    resp = {"answer": safe_answer, "sources": sources}
+    override = _has_scope(request, "policy:override")
+    try:
+        pol = pol if 'pol' in locals() else load_policy(_redis if _redis_usable() else None, tenant_label)
+        post_answer, post_sources, _pdec = policy_eval_post(safe_answer, sources, pol, override=override)
+    except Exception:
+        post_answer, post_sources = safe_answer, sources
+    resp = {"answer": post_answer, "sources": post_sources}
     # Explainability: include previews and scores if enabled
     if Config.EXPLAIN_ENABLED:
         try:
