@@ -4,6 +4,7 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.chains import RetrievalQA
 from src.config import Config
 from prometheus_client import Histogram, Counter
+import redis as _redis_mod
 import time
 
 
@@ -195,10 +196,28 @@ def build_chain(filters=None, llm_model: str | None = None, rerank_enabled: bool
     if backend == "milvus":
         # Build Milvus-backed vector store retriever with fallback to FAISS
         try:
+            # Determine read-preferred region
+            host = Config.MILVUS_HOST
+            port = str(Config.MILVUS_PORT)
+            cname = Config.MILVUS_COLLECTION
+            if Config.DR_ENABLED and Config.MILVUS_HOST_SECONDARY:
+                pref = (Config.DR_READ_PREFERRED or "primary").lower()
+                try:
+                    if Config.REDIS_URL:
+                        r = _redis_mod.Redis.from_url(Config.REDIS_URL, decode_responses=True)
+                        v = (r.get("dr:read_preferred") or pref).lower()
+                        if v in ("primary","secondary"):
+                            pref = v
+                except Exception:
+                    pass
+                if pref == "secondary":
+                    host = Config.MILVUS_HOST_SECONDARY
+                    port = str(Config.MILVUS_PORT_SECONDARY)
+                    cname = Config.MILVUS_COLLECTION_SECONDARY
             vs = LC_Milvus(
                 embedding_function=embeddings,
-                collection_name=Config.MILVUS_COLLECTION,
-                connection_args={"host": Config.MILVUS_HOST, "port": str(Config.MILVUS_PORT)},
+                collection_name=cname,
+                connection_args={"host": host, "port": port},
                 auto_id=False,
             )
         except Exception:

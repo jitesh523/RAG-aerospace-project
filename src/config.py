@@ -142,3 +142,14 @@ class Config:
     ONLINE_EVAL_SAMPLE_RATE = float(os.getenv("ONLINE_EVAL_SAMPLE_RATE", "0.1"))
     ONLINE_EVAL_DIFF_THRESHOLD = float(os.getenv("ONLINE_EVAL_DIFF_THRESHOLD", "0.15"))
     ONLINE_EVAL_WINDOW = int(os.getenv("ONLINE_EVAL_WINDOW", "200"))
+
+    # Phase 10: Multi-Region DR
+    DR_ENABLED = os.getenv("DR_ENABLED", "false").lower() == "true"
+    REGION = os.getenv("REGION", "primary")
+    # Primary Milvus (existing)
+    # Secondary Milvus for DR
+    MILVUS_HOST_SECONDARY = os.getenv("MILVUS_HOST_SECONDARY", "")
+    MILVUS_PORT_SECONDARY = int(os.getenv("MILVUS_PORT_SECONDARY", "19530"))
+    MILVUS_COLLECTION_SECONDARY = os.getenv("MILVUS_COLLECTION_SECONDARY", MILVUS_COLLECTION)
+    DR_DUAL_WRITE = os.getenv("DR_DUAL_WRITE", "true").lower() == "true"
+    DR_READ_PREFERRED = os.getenv("DR_READ_PREFERRED", "primary")  # primary|secondary
