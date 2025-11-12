@@ -158,3 +158,8 @@ class Config:
     HYBRID_V2_ENABLED = os.getenv("HYBRID_V2_ENABLED", "true").lower() == "true"
     HYBRID_V2_DENSE_WEIGHT = float(os.getenv("HYBRID_V2_DENSE_WEIGHT", "0.6"))
     HYBRID_V2_BM25_WEIGHT = float(os.getenv("HYBRID_V2_BM25_WEIGHT", "0.4"))
+
+    # Phase 13: Human-in-the-Loop (HITL)
+    HITL_ENABLED = os.getenv("HITL_ENABLED", "true").lower() == "true"
+    HITL_CONFIDENCE_THRESHOLD = float(os.getenv("HITL_CONFIDENCE_THRESHOLD", "0.35"))
+    HITL_SAMPLE_RATE = float(os.getenv("HITL_SAMPLE_RATE", "0.1"))

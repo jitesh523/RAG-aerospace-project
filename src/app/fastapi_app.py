@@ -93,6 +93,41 @@ def admin_policy_test(request: Request, tenant: str, body: dict):
     ans, srcs, post_dec = policy_eval_post(body.get("answer", ""), body.get("sources", []) or [], pol, override=bool(body.get("override", False)))
     return {"ok": True, "pre": {"filters": filt, "decision": decision}, "post": {"answer": ans, "sources": srcs, "decision": post_dec}}
 
+# ---- Phase 13: HITL admin endpoints ----
+@app.get("/admin/hitl/queue", tags=["Admin"])
+def admin_hitl_queue(request: Request, limit: int = 100):
+    require_admin(request)
+    items = []
+    if _redis_usable():
+        try:
+            raw = _redis.lrange("hitl:queue", 0, max(0, limit - 1))
+            for r in raw:
+                try:
+                    items.append(json.loads(r))
+                except Exception:
+                    continue
+        except Exception:
+            _record_redis_failure()
+    return {"ok": True, "items": items}
+
+@app.post("/admin/hitl/resolve", tags=["Admin"])
+def admin_hitl_resolve(request: Request, resolution: str, item: dict):
+    require_admin(request)
+    resv = (resolution or "ack").lower()
+    tenant = str(item.get("tenant", "")) or "__default__"
+    try:
+        HITL_REVIEWED_TOTAL.labels(tenant=tenant, resolution=resv).inc()
+    except Exception:
+        pass
+    # Optional: keep a short history of resolutions
+    if _redis_usable():
+        try:
+            _redis.lpush("hitl:resolved", json.dumps({"ts": int(time.time()), "resolution": resv, "item": item}))
+            _redis.ltrim("hitl:resolved", 0, 999)
+        except Exception:
+            _record_redis_failure()
+    return {"ok": True}
+
 # ---- Phase 9: Online eval runtime config helpers ----
 def _online_eval_cfg() -> dict:
     cfg = {
@@ -492,6 +527,20 @@ OFFLINE_EVAL_ANS_SCORE_LAST = Gauge(
 DR_REPLICATION_LAG_SECONDS = Gauge(
     "dr_replication_lag_seconds",
     "Replication lag between primary and secondary (s)",
+)
+HITL_ENQUEUED_TOTAL = Counter(
+    "hitl_enqueued_total",
+    "Total questions enqueued for human review",
+    labelnames=["tenant", "reason"],
+)
+HITL_REVIEWED_TOTAL = Counter(
+    "hitl_reviewed_total",
+    "Total human reviews resolved",
+    labelnames=["tenant", "resolution"],
+)
+HITL_CONFIDENCE = Histogram(
+    "hitl_confidence",
+    "Model confidence distribution",
 )
 
 app = FastAPI(
@@ -1299,6 +1348,59 @@ def ask(req: AskReq, request: Request):
     except Exception:
         post_answer, post_sources = safe_answer, sources
     resp = {"answer": post_answer, "sources": post_sources}
+    # Phase 13: HITL low-confidence routing
+    def _compute_confidence() -> float:
+        try:
+            conf = 0.0
+            # retrieval signal
+            topk = len(docs)
+            conf += min(topk, Config.RETRIEVER_K) / float(max(1, Config.RETRIEVER_K)) * 0.2
+            # answer length signal
+            al = len(post_answer or "")
+            conf += min(al, 400) / 400.0 * 0.2
+            # hybrid v2 blend margin
+            margin = 0.0
+            try:
+                retr = getattr(chain, "_retriever_ref", None)
+                if retr is not None and getattr(retr, "last_blend", None):
+                    b = retr.last_blend
+                    if len(b) >= 2:
+                        margin = max(0.0, float(b[0][0] - b[1][0]))
+                        conf += min(margin, 0.5) * 0.4
+            except Exception:
+                pass
+            # rerank presence
+            if rerank_enabled:
+                conf += 0.2
+            return max(0.0, min(1.0, conf))
+        except Exception:
+            return 0.0
+    try:
+        cval = _compute_confidence()
+        HITL_CONFIDENCE.observe(cval)
+        should_sample = (random.random() < max(0.0, min(1.0, float(Config.HITL_SAMPLE_RATE))))
+        if Config.HITL_ENABLED and (cval < float(Config.HITL_CONFIDENCE_THRESHOLD) or should_sample):
+            item = {
+                "id": str(uuid.uuid4()),
+                "ts": int(time.time()),
+                "tenant": tenant_label,
+                "query": q,
+                "answer": post_answer,
+                "sources": post_sources,
+                "confidence": float(cval),
+                "llm_model": model_name,
+                "rerank_enabled": bool(rerank_enabled),
+                "request_id": getattr(getattr(request, "state", None), "request_id", ""),
+            }
+            if _redis_usable():
+                try:
+                    _redis.lpush("hitl:queue", json.dumps(item))
+                    _redis.ltrim("hitl:queue", 0, 4999)
+                    HITL_ENQUEUED_TOTAL.labels(tenant=tenant_label, reason=("low_conf" if cval < float(Config.HITL_CONFIDENCE_THRESHOLD) else "sample")).inc()
+                except Exception:
+                    _record_redis_failure()
+    except Exception:
+        pass
     # Explainability: include previews and scores if enabled
     if Config.EXPLAIN_ENABLED:
         try:
