@@ -1,0 +1,27 @@
+{
+  "title": "DR Overview",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Read Preferred",
+      "targets": [
+        { "expr": "max_over_time(dr_replication_lag_seconds[1m])" }
+      ],
+      "description": "Use /admin/dr/status to see exact read_preferred; this panel tracks lag as a quick health proxy."
+    },
+    {
+      "type": "timeseries",
+      "title": "Replication Lag (s)",
+      "targets": [
+        { "expr": "dr_replication_lag_seconds" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Dual-Write Errors",
+      "targets": [
+        { "expr": "increase(dr_dual_write_errors_total[5m])" }
+      ]
+    }
+  ]
+}

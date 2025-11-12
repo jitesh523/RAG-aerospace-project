@@ -21,6 +21,30 @@ env:
     value: text-embedding-3-large
   - name: REDIS_URL
     value: "redis://rag-aerospace-redis-master:6379/0"
+  # Phase 9: Online evaluation (shadow traffic)
+  - name: ONLINE_EVAL_ENABLED
+    value: "true"
+  - name: ONLINE_EVAL_SAMPLE_RATE
+    value: "0.1"
+  - name: ONLINE_EVAL_DIFF_THRESHOLD
+    value: "0.15"
+  - name: ONLINE_EVAL_WINDOW
+    value: "200"
+  # Phase 10: DR configuration
+  - name: DR_ENABLED
+    value: "true"
+  - name: REGION
+    value: "primary"
+  - name: MILVUS_HOST_SECONDARY
+    value: milvus-secondary.milvus.svc.cluster.local
+  - name: MILVUS_PORT_SECONDARY
+    value: "19530"
+  - name: MILVUS_COLLECTION_SECONDARY
+    value: aerospace_chunks
+  - name: DR_DUAL_WRITE
+    value: "true"
+  - name: DR_READ_PREFERRED
+    value: "primary"
   # CORS default-deny: set explicit allow-list (comma-separated)
   - name: CORS_ALLOWED_ORIGINS
     value: "https://app.example.com,https://admin.example.com"

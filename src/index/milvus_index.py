@@ -4,6 +4,11 @@ from pymilvus import (
 from typing import List, Tuple
 from src.config import Config
 from prometheus_client import Counter
+import time
+try:
+    import redis as _r
+except Exception:
+    _r = None
 
 EMBED_DIM = 3072  # OpenAI text-embedding-3-large
 
@@ -75,6 +80,13 @@ def insert_rows(rows: List[Tuple[str, list, str, str, int]], name: str = Config.
     ids, embeds, texts, sources, pages = zip(*rows)
     col.insert([list(ids), list(embeds), list(texts), list(sources), list(pages)], partition_name=partition)
     col.flush()
+    # record primary write timestamp
+    try:
+        if _r is not None and Config.REDIS_URL:
+            rc = _r.Redis.from_url(Config.REDIS_URL, decode_responses=True)
+            rc.set("dr:last_write_ts:primary", str(int(time.time())))
+    except Exception:
+        pass
     # optional dual-write to secondary
     if Config.DR_ENABLED and Config.DR_DUAL_WRITE and Config.MILVUS_HOST_SECONDARY:
         try:
@@ -84,6 +96,12 @@ def insert_rows(rows: List[Tuple[str, list, str, str, int]], name: str = Config.
                     _ensure_partition(scol, partition)
                 scol.insert([list(ids), list(embeds), list(texts), list(sources), list(pages)], partition_name=partition)
                 scol.flush()
+                try:
+                    if _r is not None and Config.REDIS_URL:
+                        rc = _r.Redis.from_url(Config.REDIS_URL, decode_responses=True)
+                        rc.set("dr:last_write_ts:secondary", str(int(time.time())))
+                except Exception:
+                    pass
         except Exception:
             try:
                 DR_DUAL_WRITE_ERRORS_TOTAL.inc()

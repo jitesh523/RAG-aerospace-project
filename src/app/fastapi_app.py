@@ -149,6 +149,86 @@ def _budget_set(tenant: str, limit: float, spent: float, window: int):
     except Exception:
         pass
 
+# ---- Phase 10: DR admin endpoints ----
+def _dr_last_write_ts(role: str) -> int:
+    if _redis_usable():
+        try:
+            v = _redis.get(f"dr:last_write_ts:{role}")
+            return int(v) if v else 0
+        except Exception:
+            _record_redis_failure()
+    return 0
+
+def _dr_set_read_preferred(val: str):
+    if _redis_usable():
+        try:
+            _redis.set("dr:read_preferred", str(val))
+        except Exception:
+            _record_redis_failure()
+
+@app.post("/admin/dr/failover", tags=["Admin"])
+def admin_dr_failover(request: Request, to: str, mode: str = "drain"):
+    require_admin(request)
+    to = (to or "primary").lower()
+    if to not in ("primary", "secondary"):
+        raise HTTPException(status_code=400, detail="to must be primary|secondary")
+    _dr_set_read_preferred(to)
+    # record action
+    if _redis_usable():
+        try:
+            act = {"ts": int(time.time()), "action": "failover", "to": to, "mode": mode}
+            _redis.lpush("dr:actions", json.dumps(act))
+            _redis.ltrim("dr:actions", 0, 99)
+        except Exception:
+            _record_redis_failure()
+    return {"ok": True, "read_preferred": to}
+
+@app.get("/admin/dr/status", tags=["Admin"])
+def admin_dr_status(request: Request):
+    require_admin(request)
+    prim = check_milvus_readiness()
+    try:
+        from src.index.milvus_index import check_milvus_readiness_secondary
+        sec = check_milvus_readiness_secondary()
+    except Exception:
+        sec = {"connected": False, "has_collection": False, "loaded": False}
+    t_primary = _dr_last_write_ts("primary")
+    t_secondary = _dr_last_write_ts("secondary")
+    lag = 0
+    if t_primary and t_secondary:
+        lag = max(0, int(t_primary - t_secondary))
+    try:
+        DR_REPLICATION_LAG_SECONDS.set(lag)
+    except Exception:
+        pass
+    read_pref = "primary"
+    if _redis_usable():
+        try:
+            v = _redis.get("dr:read_preferred")
+            if v:
+                read_pref = str(v)
+        except Exception:
+            _record_redis_failure()
+    actions = []
+    if _redis_usable():
+        try:
+            raw = _redis.lrange("dr:actions", 0, 20)
+            for r in raw:
+                try:
+                    actions.append(json.loads(r))
+                except Exception:
+                    continue
+        except Exception:
+            _record_redis_failure()
+    return {
+        "ok": True,
+        "read_preferred": read_pref,
+        "primary": prim,
+        "secondary": sec,
+        "lag_seconds": lag,
+        "actions": actions,
+    }
+
 def _budget_add_spend(tenant: str, usd: float):
     try:
         limit, spent, window = _budget_get(tenant)
@@ -363,6 +443,10 @@ OFFLINE_EVAL_RECALL_LAST = Gauge(
 OFFLINE_EVAL_ANS_SCORE_LAST = Gauge(
     "offline_eval_answer_contains_last",
     "Last offline eval answer contains score",
+)
+DR_REPLICATION_LAG_SECONDS = Gauge(
+    "dr_replication_lag_seconds",
+    "Replication lag between primary and secondary (s)",
 )
 
 app = FastAPI(
