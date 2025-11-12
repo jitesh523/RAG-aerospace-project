@@ -19,6 +19,7 @@ import jwt
 import redis
 import requests
 import concurrent.futures
+import random
 
 from opentelemetry import trace as ot_trace
 from opentelemetry.sdk.resources import Resource
@@ -33,6 +34,7 @@ from src.config import Config
 from src.index.milvus_index import check_milvus_readiness
 from src.eval.offline_eval import run_offline_eval
 from src.eval.feedback_export import export_feedback
+from src.eval.online_eval import run_shadow_eval
 
 
 def _get_cache_ns() -> int:
@@ -45,6 +47,44 @@ def _get_cache_ns() -> int:
             return 1
         except Exception:
             pass
+
+# ---- Phase 9: Online eval runtime config helpers ----
+def _online_eval_cfg() -> dict:
+    cfg = {
+        "enabled": Config.ONLINE_EVAL_ENABLED,
+        "sample_rate": Config.ONLINE_EVAL_SAMPLE_RATE,
+        "diff_threshold": Config.ONLINE_EVAL_DIFF_THRESHOLD,
+        "window": Config.ONLINE_EVAL_WINDOW,
+    }
+    if _redis_usable():
+        try:
+            raw = _redis.hgetall("online:eval:config") or {}
+            if raw:
+                if str(raw.get("enabled", "")).lower() in ("true","false"):
+                    cfg["enabled"] = str(raw.get("enabled")).lower() == "true"
+                if "sample_rate" in raw:
+                    cfg["sample_rate"] = float(raw.get("sample_rate"))
+                if "diff_threshold" in raw:
+                    cfg["diff_threshold"] = float(raw.get("diff_threshold"))
+                if "window" in raw:
+                    cfg["window"] = int(raw.get("window"))
+        except Exception:
+            _record_redis_failure()
+            pass
+    return cfg
+
+def _online_eval_enabled() -> bool:
+    try:
+        return bool(_online_eval_cfg().get("enabled", False))
+    except Exception:
+        return False
+
+def _online_eval_sample_rate() -> float:
+    try:
+        r = float(_online_eval_cfg().get("sample_rate", 0.0))
+        return max(0.0, min(1.0, r))
+    except Exception:
+        return 0.0
 
 def _tenant_ttl(tenant: str) -> int:
     try:
@@ -796,6 +836,12 @@ def ask(req: AskReq, request: Request):
     if model_override:
         model_name = model_override
     rerank_enabled = _get_rerank_enabled(tenant_label)
+    # Phase 9: fire-and-forget shadow online eval with sampling
+    try:
+        if _online_eval_enabled() and random.random() < _online_eval_sample_rate():
+            run_shadow_eval(tenant_label, q, req.filters, treatment_model=model_name, treatment_rerank=rerank_enabled)
+    except Exception:
+        pass
     # Build or reuse chain for this routing
     key_rt = (model_name, bool(rerank_enabled))
     chain = _qa_cache.get(key_rt)

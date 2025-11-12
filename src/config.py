@@ -136,3 +136,9 @@ class Config:
     # Feedback export
     EXPORT_S3_BUCKET = os.getenv("EXPORT_S3_BUCKET", "")
     EXPORT_S3_PREFIX = os.getenv("EXPORT_S3_PREFIX", "exports/")
+
+    # Phase 9: Online eval & shadow traffic
+    ONLINE_EVAL_ENABLED = os.getenv("ONLINE_EVAL_ENABLED", "false").lower() == "true"
+    ONLINE_EVAL_SAMPLE_RATE = float(os.getenv("ONLINE_EVAL_SAMPLE_RATE", "0.1"))
+    ONLINE_EVAL_DIFF_THRESHOLD = float(os.getenv("ONLINE_EVAL_DIFF_THRESHOLD", "0.15"))
+    ONLINE_EVAL_WINDOW = int(os.getenv("ONLINE_EVAL_WINDOW", "200"))

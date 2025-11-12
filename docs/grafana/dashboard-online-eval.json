@@ -1,0 +1,19 @@
+{
+  "title": "Online Eval",
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Shadow Events by Bucket",
+      "targets": [
+        { "expr": "sum(increase(online_eval_events_total[5m])) by (bucket)" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Shadow Latency (p95) by Bucket",
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum(rate(online_eval_latency_seconds_bucket[5m])) by (le, bucket))" }
+      ]
+    }
+  ]
+}
