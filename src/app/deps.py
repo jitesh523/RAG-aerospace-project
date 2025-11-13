@@ -6,6 +6,11 @@ try:
 except Exception:
     AzureChatOpenAI = None  # type: ignore
     AzureOpenAIEmbeddings = None  # type: ignore
+try:
+    from langchain_aws import ChatBedrock, BedrockEmbeddings
+except Exception:
+    ChatBedrock = None  # type: ignore
+    BedrockEmbeddings = None  # type: ignore
 from langchain.chains import RetrievalQA
 from src.config import Config
 from prometheus_client import Histogram, Counter
@@ -198,6 +203,8 @@ def _select_llm(provider: str | None, model: str):
             azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
             api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01")
         )
+    if prov == "bedrock" and ChatBedrock is not None and Config.BEDROCK_CHAT_MODEL and Config.BEDROCK_REGION:
+        return ChatBedrock(model_id=Config.BEDROCK_CHAT_MODEL, region_name=Config.BEDROCK_REGION)
     return ChatOpenAI(model=model, temperature=0, api_key=Config.OPENAI_API_KEY)
 
 def _emb_provider_for_doc(doc_type: str | None) -> tuple[str, str]:
@@ -236,6 +243,9 @@ def _emb_provider_for_doc(doc_type: str | None) -> tuple[str, str]:
 def _select_embeddings(provider: str, model: str):
     if provider == "azure_openai" and AzureOpenAIEmbeddings is not None:
         return AzureOpenAIEmbeddings(azure_deployment=model, api_key=Config.OPENAI_API_KEY, azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"), api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01"))
+    if provider == "bedrock" and BedrockEmbeddings is not None and (model or Config.BEDROCK_EMBEDDING_MODEL) and Config.BEDROCK_REGION:
+        mid = model or Config.BEDROCK_EMBEDDING_MODEL
+        return BedrockEmbeddings(model_id=mid, region_name=Config.BEDROCK_REGION)
     return OpenAIEmbeddings(model=model, api_key=Config.OPENAI_API_KEY)
 
 def build_chain(filters=None, llm_model: str | None = None, rerank_enabled: bool | None = None, k_override: int | None = None, fetch_k_override: int | None = None, milvus_collection_override: str | None = None, llm_provider: str | None = None):

@@ -168,3 +168,8 @@ class Config:
     ROUTER_ENABLED = os.getenv("ROUTER_ENABLED", "true").lower() == "true"
     ROUTER_DEFAULT_OBJECTIVE = os.getenv("ROUTER_DEFAULT_OBJECTIVE", "balanced")  # cost|latency|quality|balanced
     ROUTER_ALLOWED_PROVIDERS = [s.strip() for s in os.getenv("ROUTER_ALLOWED_PROVIDERS", "openai").split(",")]
+
+    # Bedrock (optional)
+    BEDROCK_REGION = os.getenv("BEDROCK_REGION", "")
+    BEDROCK_CHAT_MODEL = os.getenv("BEDROCK_CHAT_MODEL", "")
+    BEDROCK_EMBEDDING_MODEL = os.getenv("BEDROCK_EMBEDDING_MODEL", "")

@@ -509,6 +509,41 @@ def admin_embeddings_map_set(request: Request, provider_map: dict | None = None,
             _record_redis_failure()
     return admin_embeddings_map_get(request)
 
+# ---- Router providers overview ----
+@app.get("/admin/router/providers", tags=["Admin"])
+def admin_router_providers(request: Request):
+    require_admin(request)
+    providers = []
+    # openai
+    providers.append({
+        "name": "openai",
+        "imported": True,
+        "configured": bool(Config.OPENAI_API_KEY),
+    })
+    # azure_openai
+    try:
+        imported = True if AzureChatOpenAI is not None else False  # type: ignore
+    except Exception:
+        imported = False
+    providers.append({
+        "name": "azure_openai",
+        "imported": imported,
+        "configured": bool(os.getenv("AZURE_OPENAI_ENDPOINT")) and bool(Config.OPENAI_API_KEY),
+    })
+    # bedrock
+    try:
+        from langchain_aws import ChatBedrock  # type: ignore
+        bed_imported = True
+    except Exception:
+        bed_imported = False
+    providers.append({
+        "name": "bedrock",
+        "imported": bed_imported,
+        "configured": bool(Config.BEDROCK_REGION) and bool(Config.BEDROCK_CHAT_MODEL),
+        "region": Config.BEDROCK_REGION,
+    })
+    return {"ok": True, "providers": providers, "allowed": Config.ROUTER_ALLOWED_PROVIDERS}
+
 # ---- Phase 18: Router admin endpoints ----
 def _router_policy(tenant: str) -> dict:
     pol = {"objective": Config.ROUTER_DEFAULT_OBJECTIVE, "allowed_providers": Config.ROUTER_ALLOWED_PROVIDERS}
