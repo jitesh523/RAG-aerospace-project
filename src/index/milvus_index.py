@@ -127,6 +127,63 @@ def check_milvus_readiness(name: str = Config.MILVUS_COLLECTION) -> dict:
         pass
     return info
 
+# ---- Re-embedding backfill to canary ----
+def reembed_active_to_canary(embeddings, provider: str, model: str, limit: int = 10000, batch_size: int = 256) -> dict:
+    """Reads up to 'limit' rows from active collection, re-embeds text, and writes to canary collection.
+    Stores provider/model metadata in Redis for the canary index.
+    """
+    active = get_active_collection_name()
+    canary = get_canary_collection_name()
+    connect()
+    ensure_collection(canary)
+    col = Collection(active)
+    # load to ensure query works
+    try:
+        col.load()
+    except Exception:
+        pass
+    rows = []
+    try:
+        # Best-effort: pull up to 'limit' docs
+        docs = col.query(expr="", output_fields=["id","text","source","page"], limit=limit)
+    except Exception:
+        docs = []
+    # Embed and write in batches
+    total = 0
+    buf_ids, buf_embs, buf_texts, buf_sources, buf_pages = [], [], [], [], []
+    def _flush():
+        nonlocal total, buf_ids, buf_embs, buf_texts, buf_sources, buf_pages
+        if not buf_ids:
+            return
+        insert_rows(list(zip(buf_ids, buf_embs, buf_texts, buf_sources, buf_pages)), name=canary)
+        total += len(buf_ids)
+        buf_ids, buf_embs, buf_texts, buf_sources, buf_pages = [], [], [], [], []
+    for d in docs:
+        try:
+            tid = str(d.get("id"))
+            text = d.get("text") or ""
+            src = d.get("source") or ""
+            page = int(d.get("page") or 0)
+            emb = embeddings.embed_documents([text])[0]
+            buf_ids.append(tid)
+            buf_embs.append(emb)
+            buf_texts.append(text)
+            buf_sources.append(src)
+            buf_pages.append(page)
+            if len(buf_ids) >= max(1, int(batch_size)):
+                _flush()
+        except Exception:
+            continue
+    _flush()
+    # record metadata for canary
+    r = _rc()
+    if r is not None:
+        try:
+            r.hset("index:canary:embed_meta", mapping={"provider": provider, "model": model, "rows": str(total)})
+        except Exception:
+            pass
+    return {"active": active, "canary": canary, "rows": total, "provider": provider, "model": model}
+
 # ---- Phase 17: Canary index helpers ----
 def _rc() -> Optional['_r.Redis']:
     if _r is None or not Config.REDIS_URL:

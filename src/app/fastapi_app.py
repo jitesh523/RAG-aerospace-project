@@ -1,3 +1,12 @@
+from langchain_openai import OpenAIEmbeddings
+try:
+    from langchain_openai import AzureOpenAIEmbeddings
+except Exception:
+    AzureOpenAIEmbeddings = None  # type: ignore
+try:
+    from langchain_aws import BedrockEmbeddings
+except Exception:
+    BedrockEmbeddings = None  # type: ignore
 def _has_scope(request: 'Request', needle: str) -> bool:
     try:
         authz = request.headers.get("authorization", "")
@@ -162,7 +171,7 @@ from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
 
 from src.app.deps import build_chain
 from src.config import Config
-from src.index.milvus_index import check_milvus_readiness, begin_canary_build, promote_canary, index_status
+from src.index.milvus_index import check_milvus_readiness, begin_canary_build, promote_canary, index_status, reembed_active_to_canary
 from src.eval.offline_eval import run_offline_eval
 from src.eval.feedback_export import export_feedback
 from src.eval.online_eval import run_shadow_eval
@@ -586,7 +595,92 @@ def admin_router_status(request: Request, limit: int = 100):
                     continue
         except Exception:
             _record_redis_failure()
-    return {"ok": True, "items": items}
+    # Provider health summary
+    def _percentile(vals: list[float], pct: float) -> float:
+        if not vals:
+            return 0.0
+        s = sorted(vals)
+        k = int(max(0, min(len(s) - 1, round((pct/100.0) * (len(s)-1)))))
+        return float(s[k])
+    def _prov_stats(p: str) -> dict:
+        stats = {"provider": p, "p50": None, "p95": None, "error_rate_5m": None, "qps_1m": None, "last_error": None}
+        if not _redis_usable():
+            return stats
+        try:
+            lats = [float(x) for x in (_redis.lrange(f"prov:lat:{p}", 0, 199) or [])]
+            stats["p50"] = _percentile(lats, 50)
+            stats["p95"] = _percentile(lats, 95)
+            now = int(time.time())
+            # errors
+            err_ts = [int(x) for x in (_redis.lrange(f"prov:errts:{p}", 0, 499) or [])]
+            stats["error_rate_5m"] = float(sum(1 for t in err_ts if now - t <= 300)) / max(1.0, 300.0)
+            # qps
+            req_ts = [int(x) for x in (_redis.lrange(f"prov:reqts:{p}", 0, 999) or [])]
+            stats["qps_1m"] = float(sum(1 for t in req_ts if now - t <= 60)) / 60.0
+            le = _redis.get(f"prov:errlast:{p}")
+            if le:
+                stats["last_error"] = str(le)
+        except Exception:
+            _record_redis_failure()
+        return stats
+    provs = list(set((Config.ROUTER_ALLOWED_PROVIDERS or ["openai"])) | set(["openai","azure_openai","bedrock"]))
+    health = [_prov_stats(p) for p in provs]
+    return {"ok": True, "items": items, "health": health}
+
+@app.post("/admin/index/canary/reembed", tags=["Admin"])
+def admin_index_canary_reembed(request: Request, body: dict):
+    require_admin(request)
+    provider = (body or {}).get("provider") or "openai"
+    model = (body or {}).get("model") or Config.EMBED_MODEL
+    limit = int((body or {}).get("limit") or 10000)
+    batch_size = int((body or {}).get("batch_size") or 256)
+    # ensure canary exists
+    begin_canary_build()
+    # construct embeddings per provider
+    embeddings = None
+    if provider == "azure_openai" and AzureOpenAIEmbeddings is not None:
+        embeddings = AzureOpenAIEmbeddings(azure_deployment=model, api_key=Config.OPENAI_API_KEY, azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"), api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01"))
+    elif provider == "bedrock" and BedrockEmbeddings is not None and Config.BEDROCK_REGION:
+        embeddings = BedrockEmbeddings(model_id=model or Config.BEDROCK_EMBEDDING_MODEL, region_name=Config.BEDROCK_REGION)
+    else:
+        embeddings = OpenAIEmbeddings(model=model, api_key=Config.OPENAI_API_KEY)
+    res = reembed_active_to_canary(embeddings, provider=provider, model=model, limit=limit, batch_size=batch_size)
+    return {"ok": True, "reembedded": res}
+
+@app.get("/admin/router/costs", tags=["Admin"])
+def admin_router_get_costs(request: Request, provider: str, model: str):
+    require_admin(request)
+    data = {"prompt": None, "completion": None}
+    if _redis_usable():
+        try:
+            h = _redis.hgetall(f"router:cost:{provider}:{model}") or {}
+            if "prompt" in h:
+                data["prompt"] = float(h.get("prompt"))
+            if "completion" in h:
+                data["completion"] = float(h.get("completion"))
+        except Exception:
+            _record_redis_failure()
+    return {"ok": True, "provider": provider, "model": model, "costs": data}
+
+@app.post("/admin/router/costs", tags=["Admin"])
+def admin_router_set_costs(request: Request, body: dict):
+    require_admin(request)
+    provider = (body or {}).get("provider")
+    model = (body or {}).get("model")
+    if not provider or not model:
+        raise HTTPException(status_code=400, detail="provider and model are required")
+    if _redis_usable():
+        try:
+            mapping = {}
+            if "prompt" in (body or {}):
+                mapping["prompt"] = str(float(body.get("prompt")))
+            if "completion" in (body or {}):
+                mapping["completion"] = str(float(body.get("completion")))
+            if mapping:
+                _redis.hset(f"router:cost:{provider}:{model}", mapping=mapping)
+        except Exception:
+            _record_redis_failure()
+    return admin_router_get_costs(request, provider=provider, model=model)
 
 def _router_decide(tenant: str, fallback_model: str) -> tuple[str, str, str]:
     """Return (model, provider, reason)."""
@@ -595,22 +689,64 @@ def _router_decide(tenant: str, fallback_model: str) -> tuple[str, str, str]:
     pol = _router_policy(tenant)
     objective = (pol.get("objective") or "balanced").lower()
     allowed = pol.get("allowed_providers") or ["openai"]
-    # Minimal provider map; extend as vendors added
-    provider = "openai" if "openai" in allowed else allowed[0]
+    # Helper readers for health and cost
+    def _p95(p: str) -> float:
+        if not _redis_usable():
+            return 999.0
+        try:
+            lats = [float(x) for x in (_redis.lrange(f"prov:lat:{p}", 0, 199) or [])]
+            if not lats:
+                return 999.0
+            s = sorted(lats)
+            idx = int(max(0, min(len(s)-1, round(0.95*(len(s)-1)))))
+            return float(s[idx])
+        except Exception:
+            return 999.0
+    def _cost_prompt_per_1k(p: str, m: str) -> float:
+        if not _redis_usable():
+            return 999.0
+        try:
+            h = _redis.hgetall(f"router:cost:{p}:{m}") or {}
+            if "prompt" in h:
+                return float(h.get("prompt"))
+        except Exception:
+            pass
+        return 999.0
+    # Candidate scoring
     model = fallback_model
+    provider = allowed[0] if allowed else "openai"
     reason = objective
-    try:
-        if objective in ("cost", "latency"):
-            model = Config.LLM_MODEL_CHEAP
-            reason = objective
-        elif objective == "quality":
-            model = Config.LLM_MODEL_A
-            reason = "quality"
-        else:
-            # balanced: keep fallback
-            reason = "balanced"
-    except Exception:
-        pass
+    if objective == "latency":
+        best = 1e9
+        for p in allowed:
+            v = _p95(p)
+            if v < best:
+                best = v
+                provider = p
+        reason = "latency"
+        model = Config.LLM_MODEL_CHEAP
+    elif objective == "cost":
+        best = 1e9
+        for p in allowed:
+            v = _cost_prompt_per_1k(p, fallback_model)
+            if v < best:
+                best = v
+                provider = p
+        reason = "cost"
+        model = Config.LLM_MODEL_CHEAP
+    elif objective == "quality":
+        provider = allowed[0] if allowed else "openai"
+        model = Config.LLM_MODEL_A
+        reason = "quality"
+    else:
+        # balanced: min of normalized latency + cost
+        best = 1e9
+        for p in allowed:
+            v = (_p95(p)/2.0) + (_cost_prompt_per_1k(p, fallback_model)/2.0)
+            if v < best:
+                best = v
+                provider = p
+        reason = "balanced"
     try:
         _redis.lpush("router:hist", json.dumps({"ts": int(time.time()), "tenant": tenant, "provider": provider, "model": model, "reason": reason}))
         _redis.ltrim("router:hist", 0, 999)
@@ -1914,6 +2050,16 @@ def ask(req: AskReq, request: Request):
                             PROVIDER_LLM_LATENCY.labels(provider=routed_provider).observe(dur)
                         except Exception:
                             pass
+                        # record provider success timestamp and latency window
+                        if _redis_usable():
+                            try:
+                                nowts = int(time.time())
+                                _redis.lpush(f"prov:reqts:{routed_provider}", nowts)
+                                _redis.ltrim(f"prov:reqts:{routed_provider}", 0, 999)
+                                _redis.lpush(f"prov:lat:{routed_provider}", dur)
+                                _redis.ltrim(f"prov:lat:{routed_provider}", 0, 199)
+                            except Exception:
+                                _record_redis_failure()
                     except Exception:
                         pass
                 except concurrent.futures.TimeoutError:
@@ -1925,6 +2071,15 @@ def ask(req: AskReq, request: Request):
                         PROVIDER_ERRORS_TOTAL.labels(provider=routed_provider).inc()
                     except Exception:
                         pass
+                    # record provider error
+                    if _redis_usable():
+                        try:
+                            nowts = int(time.time())
+                            _redis.lpush(f"prov:errts:{routed_provider}", nowts)
+                            _redis.ltrim(f"prov:errts:{routed_provider}", 0, 499)
+                            _redis.set(f"prov:errlast:{routed_provider}", "timeout")
+                        except Exception:
+                            _record_redis_failure()
                     raise HTTPException(status_code=504, detail="LLM timeout")
         except HTTPException:
             # surfaced timeout
@@ -1948,10 +2103,15 @@ def ask(req: AskReq, request: Request):
                     ASK_RETRIES_TOTAL.inc()
             except Exception:
                 pass
-            try:
-                PROVIDER_ERRORS_TOTAL.labels(provider=routed_provider).inc()
-            except Exception:
-                pass
+            # record provider error
+            if _redis_usable():
+                try:
+                    nowts = int(time.time())
+                    _redis.lpush(f"prov:errts:{routed_provider}", nowts)
+                    _redis.ltrim(f"prov:errts:{routed_provider}", 0, 499)
+                    _redis.set(f"prov:errlast:{routed_provider}", "exception")
+                except Exception:
+                    _record_redis_failure()
             if attempt < Config.RETRY_MAX_ATTEMPTS:
                 time.sleep(delay)
                 delay *= 2
