@@ -483,6 +483,32 @@ def admin_tenant_export_summaries(request: Request, tenants: list[str] | None = 
             _record_redis_failure()
     return PlainTextResponse(content=content, media_type="application/jsonl")
 
+# ---- Embeddings provider/model map admin ----
+@app.get("/admin/embeddings/map", tags=["Admin"])
+def admin_embeddings_map_get(request: Request):
+    require_admin(request)
+    out = {"provider_map": {}, "model_map": {}}
+    if _redis_usable():
+        try:
+            out["provider_map"] = _redis.hgetall("emb:provider_map") or {}
+            out["model_map"] = _redis.hgetall("emb:model_map") or {}
+        except Exception:
+            _record_redis_failure()
+    return {"ok": True, "map": out}
+
+@app.post("/admin/embeddings/map", tags=["Admin"])
+def admin_embeddings_map_set(request: Request, provider_map: dict | None = None, model_map: dict | None = None):
+    require_admin(request)
+    if _redis_usable():
+        try:
+            if provider_map:
+                _redis.hset("emb:provider_map", mapping={k: str(v) for k, v in provider_map.items()})
+            if model_map:
+                _redis.hset("emb:model_map", mapping={k: str(v) for k, v in model_map.items()})
+        except Exception:
+            _record_redis_failure()
+    return admin_embeddings_map_get(request)
+
 # ---- Phase 18: Router admin endpoints ----
 def _router_policy(tenant: str) -> dict:
     pol = {"objective": Config.ROUTER_DEFAULT_OBJECTIVE, "allowed_providers": Config.ROUTER_ALLOWED_PROVIDERS}
@@ -1702,7 +1728,7 @@ def ask(req: AskReq, request: Request):
     chain = _qa_cache.get(key_rt)
     if chain is None:
         try:
-            chain = build_chain(filters=req.filters, llm_model=model_name, rerank_enabled=rerank_enabled)
+            chain = build_chain(filters=req.filters, llm_model=model_name, rerank_enabled=rerank_enabled, llm_provider=routed_provider)
             _qa_cache[key_rt] = chain
         except Exception:
             chain = None

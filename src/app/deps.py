@@ -1,6 +1,11 @@
 from langchain_community.vectorstores import FAISS
 from langchain_community.vectorstores import Milvus as LC_Milvus
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+try:
+    from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
+except Exception:
+    AzureChatOpenAI = None  # type: ignore
+    AzureOpenAIEmbeddings = None  # type: ignore
 from langchain.chains import RetrievalQA
 from src.config import Config
 from prometheus_client import Histogram, Counter
@@ -183,7 +188,57 @@ def _faiss_filter_callable_from_filters(filters):
             return False
     return _pred
 
-def build_chain(filters=None, llm_model: str | None = None, rerank_enabled: bool | None = None, k_override: int | None = None, fetch_k_override: int | None = None, milvus_collection_override: str | None = None):
+def _select_llm(provider: str | None, model: str):
+    prov = (provider or "openai").lower()
+    if prov == "azure_openai" and AzureChatOpenAI is not None:
+        return AzureChatOpenAI(
+            azure_deployment=model,
+            temperature=0,
+            api_key=Config.OPENAI_API_KEY,
+            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01")
+        )
+    return ChatOpenAI(model=model, temperature=0, api_key=Config.OPENAI_API_KEY)
+
+def _emb_provider_for_doc(doc_type: str | None) -> tuple[str, str]:
+    # returns (provider, model)
+    provider = "openai"
+    model = Config.EMBED_MODEL
+    # Config string map supports small/large
+    try:
+        if Config.EMBED_MODEL_MAP:
+            parts = [p.strip() for p in (Config.EMBED_MODEL_MAP or "").split(",")]
+            mp = {}
+            for p in parts:
+                if ":" in p:
+                    k, v = p.split(":", 1)
+                    mp[k.strip()] = v.strip()
+            key = (doc_type or "default").lower()
+            sel = mp.get(key, mp.get("default", "large"))
+            model = Config.EMBED_MODEL_SMALL if sel == "small" else Config.EMBED_MODEL_LARGE
+    except Exception:
+        pass
+    # Redis overrides per doc_type
+    try:
+        if Config.REDIS_URL:
+            r = _redis_mod.Redis.from_url(Config.REDIS_URL, decode_responses=True)
+            if doc_type:
+                pv = r.hget("emb:provider_map", doc_type)
+                mv = r.hget("emb:model_map", doc_type)
+                if pv:
+                    provider = pv
+                if mv:
+                    model = mv
+    except Exception:
+        pass
+    return provider, model
+
+def _select_embeddings(provider: str, model: str):
+    if provider == "azure_openai" and AzureOpenAIEmbeddings is not None:
+        return AzureOpenAIEmbeddings(azure_deployment=model, api_key=Config.OPENAI_API_KEY, azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"), api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01"))
+    return OpenAIEmbeddings(model=model, api_key=Config.OPENAI_API_KEY)
+
+def build_chain(filters=None, llm_model: str | None = None, rerank_enabled: bool | None = None, k_override: int | None = None, fetch_k_override: int | None = None, milvus_collection_override: str | None = None, llm_provider: str | None = None):
     if Config.MOCK_MODE:
         class _FakeChain:
             def invoke(self, q):
@@ -191,9 +246,16 @@ def build_chain(filters=None, llm_model: str | None = None, rerank_enabled: bool
                 doc = SimpleNamespace(metadata={"source": "mock.pdf", "page": 1})
                 return {"result": f"mock answer: {q}", "source_documents": [doc]}
         return _FakeChain()
+    import os
     model = llm_model or "gpt-4o-mini"
-    llm = ChatOpenAI(model=model, temperature=0, api_key=Config.OPENAI_API_KEY)
-    embeddings = OpenAIEmbeddings(model=Config.EMBED_MODEL, api_key=Config.OPENAI_API_KEY)
+    llm = _select_llm(llm_provider, model)
+    doc_type = None
+    try:
+        doc_type = getattr(filters, "doc_type", None) if filters else None
+    except Exception:
+        doc_type = None
+    emb_provider, emb_model = _emb_provider_for_doc(doc_type)
+    embeddings = _select_embeddings(emb_provider, emb_model)
     backend = Config.RETRIEVER_BACKEND
     if backend == "milvus":
         # Build Milvus-backed vector store retriever with fallback to FAISS
