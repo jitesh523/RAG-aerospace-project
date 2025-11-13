@@ -316,6 +316,84 @@ def admin_source_freshness(request: Request, source: str, ts: int | None = None)
     _freshness_update_metrics()
     return {"ok": True}
 
+# ---- Phase 18: Router admin endpoints ----
+def _router_policy(tenant: str) -> dict:
+    pol = {"objective": Config.ROUTER_DEFAULT_OBJECTIVE, "allowed_providers": Config.ROUTER_ALLOWED_PROVIDERS}
+    if _redis_usable():
+        try:
+            raw = _redis.get(f"router:policy:{tenant}")
+            if raw:
+                d = json.loads(raw)
+                pol.update(d)
+        except Exception:
+            _record_redis_failure()
+    return pol
+
+@app.get("/admin/router/policy", tags=["Admin"])
+def admin_router_get_policy(request: Request, tenant: str):
+    require_admin(request)
+    return {"ok": True, "tenant": tenant, "policy": _router_policy(tenant)}
+
+@app.post("/admin/router/policy", tags=["Admin"])
+def admin_router_set_policy(request: Request, tenant: str, body: dict):
+    require_admin(request)
+    if _redis_usable():
+        try:
+            _redis.set(f"router:policy:{tenant}", json.dumps(body or {}))
+        except Exception:
+            _record_redis_failure()
+    return {"ok": True, "tenant": tenant, "policy": _router_policy(tenant)}
+
+@app.get("/admin/router/status", tags=["Admin"])
+def admin_router_status(request: Request, limit: int = 100):
+    require_admin(request)
+    items = []
+    if _redis_usable():
+        try:
+            raw = _redis.lrange("router:hist", 0, max(0, limit - 1))
+            for r in raw:
+                try:
+                    items.append(json.loads(r))
+                except Exception:
+                    continue
+        except Exception:
+            _record_redis_failure()
+    return {"ok": True, "items": items}
+
+def _router_decide(tenant: str, fallback_model: str) -> tuple[str, str, str]:
+    """Return (model, provider, reason)."""
+    if not Config.ROUTER_ENABLED:
+        return fallback_model, "openai", "disabled"
+    pol = _router_policy(tenant)
+    objective = (pol.get("objective") or "balanced").lower()
+    allowed = pol.get("allowed_providers") or ["openai"]
+    # Minimal provider map; extend as vendors added
+    provider = "openai" if "openai" in allowed else allowed[0]
+    model = fallback_model
+    reason = objective
+    try:
+        if objective in ("cost", "latency"):
+            model = Config.LLM_MODEL_CHEAP
+            reason = objective
+        elif objective == "quality":
+            model = Config.LLM_MODEL_A
+            reason = "quality"
+        else:
+            # balanced: keep fallback
+            reason = "balanced"
+    except Exception:
+        pass
+    try:
+        _redis.lpush("router:hist", json.dumps({"ts": int(time.time()), "tenant": tenant, "provider": provider, "model": model, "reason": reason}))
+        _redis.ltrim("router:hist", 0, 999)
+    except Exception:
+        _record_redis_failure()
+    try:
+        ROUTER_DECISIONS_TOTAL.labels(tenant=tenant, provider=provider, reason=reason).inc()
+    except Exception:
+        pass
+    return model, provider, reason
+
 # ---- Phase 14: Cache and Cost admin endpoints ----
 def _cache_cfg() -> dict:
     cfg = {
@@ -863,6 +941,21 @@ SOURCE_FRESHNESS_LAG_SECONDS = Gauge(
     "Source data freshness lag in seconds",
     labelnames=["source"],
 )
+ROUTER_DECISIONS_TOTAL = Counter(
+    "router_decisions_total",
+    "Router decisions by provider and reason",
+    labelnames=["tenant", "provider", "reason"],
+)
+PROVIDER_ERRORS_TOTAL = Counter(
+    "provider_errors_total",
+    "Provider-level errors",
+    labelnames=["provider"],
+)
+PROVIDER_LLM_LATENCY = Histogram(
+    "provider_llm_latency_seconds",
+    "LLM latency by provider",
+    labelnames=["provider"],
+)
 HITL_ENQUEUED_TOTAL = Counter(
     "hitl_enqueued_total",
     "Total questions enqueued for human review",
@@ -1394,6 +1487,12 @@ def ask(req: AskReq, request: Request):
     model_name = Config.LLM_MODEL_A if llm_variant == "A" else Config.LLM_MODEL_B
     if model_override:
         model_name = model_override
+    # Phase 18: route provider/model decision
+    routed_provider = "openai"
+    try:
+        model_name, routed_provider, _rreason = _router_decide(tenant_label, model_name)
+    except Exception:
+        pass
     rerank_enabled = _get_rerank_enabled(tenant_label)
     # Phase 14: coarse prompt cache read (pre-LLM)
     coarse_cache_key = None
@@ -1581,7 +1680,12 @@ def ask(req: AskReq, request: Request):
                 try:
                     result = fut.result(timeout=max(1, Config.LLM_TIMEOUT_SECONDS))
                     try:
-                        ASK_LLM_DURATION.observe(time.time() - llm_t0)
+                        dur = time.time() - llm_t0
+                        ASK_LLM_DURATION.observe(dur)
+                        try:
+                            PROVIDER_LLM_LATENCY.labels(provider=routed_provider).observe(dur)
+                        except Exception:
+                            pass
                     except Exception:
                         pass
                 except concurrent.futures.TimeoutError:
@@ -1589,6 +1693,10 @@ def ask(req: AskReq, request: Request):
                     _cb_failures += 1
                     if _cb_failures >= Config.CB_FAIL_THRESHOLD:
                         _cb_open_until = time.time() + Config.CB_RESET_SECONDS
+                    try:
+                        PROVIDER_ERRORS_TOTAL.labels(provider=routed_provider).inc()
+                    except Exception:
+                        pass
                     raise HTTPException(status_code=504, detail="LLM timeout")
         except HTTPException:
             # surfaced timeout
@@ -1610,6 +1718,10 @@ def ask(req: AskReq, request: Request):
             try:
                 if attempt < Config.RETRY_MAX_ATTEMPTS:
                     ASK_RETRIES_TOTAL.inc()
+            except Exception:
+                pass
+            try:
+                PROVIDER_ERRORS_TOTAL.labels(provider=routed_provider).inc()
             except Exception:
                 pass
             if attempt < Config.RETRY_MAX_ATTEMPTS:

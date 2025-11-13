@@ -163,3 +163,8 @@ class Config:
     HITL_ENABLED = os.getenv("HITL_ENABLED", "true").lower() == "true"
     HITL_CONFIDENCE_THRESHOLD = float(os.getenv("HITL_CONFIDENCE_THRESHOLD", "0.35"))
     HITL_SAMPLE_RATE = float(os.getenv("HITL_SAMPLE_RATE", "0.1"))
+
+    # Phase 18: Model Router & Vendor Neutrality
+    ROUTER_ENABLED = os.getenv("ROUTER_ENABLED", "true").lower() == "true"
+    ROUTER_DEFAULT_OBJECTIVE = os.getenv("ROUTER_DEFAULT_OBJECTIVE", "balanced")  # cost|latency|quality|balanced
+    ROUTER_ALLOWED_PROVIDERS = [s.strip() for s in os.getenv("ROUTER_ALLOWED_PROVIDERS", "openai").split(",")]

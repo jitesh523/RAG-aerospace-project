@@ -1,0 +1,43 @@
+{
+  "title": "Model Router",
+  "uid": "router",
+  "schemaVersion": 37,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "type": "bargauge",
+      "title": "Router Decisions by Provider",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "sum(rate(router_decisions_total[5m])) by (provider)", "legendFormat": "{{provider}}" }
+      ]
+    },
+    {
+      "type": "bargauge",
+      "title": "Router Decisions by Reason",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "sum(rate(router_decisions_total[5m])) by (reason)", "legendFormat": "{{reason}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Provider LLM Latency p50/p90",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "histogram_quantile(0.5, sum(rate(provider_llm_latency_seconds_bucket[5m])) by (le, provider))", "legendFormat": "p50 {{provider}}" },
+        { "expr": "histogram_quantile(0.9, sum(rate(provider_llm_latency_seconds_bucket[5m])) by (le, provider))", "legendFormat": "p90 {{provider}}" }
+      ]
+    },
+    {
+      "type": "bargauge",
+      "title": "Provider Errors (rate)",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "sum(rate(provider_errors_total[5m])) by (provider)", "legendFormat": "{{provider}}" }
+      ]
+    }
+  ]
+}
