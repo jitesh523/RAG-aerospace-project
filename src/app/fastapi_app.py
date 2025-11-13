@@ -180,6 +180,45 @@ def _get_cache_ns() -> int:
         except Exception:
             pass
 
+# ---- Phase 16: Observability tracing init ----
+_tracer = ot_trace.get_tracer("rag.app")
+def _init_tracing():
+    try:
+        if Config.OTEL_ENABLED and Config.OTEL_EXPORTER_OTLP_ENDPOINT:
+            provider = TracerProvider(resource=Resource.create({"service.name": Config.OTEL_SERVICE_NAME}))
+            exporter = OTLPSpanExporter(endpoint=Config.OTEL_EXPORTER_OTLP_ENDPOINT)
+            processor = BatchSpanProcessor(exporter)
+            provider.add_span_processor(processor)
+            ot_trace.set_tracer_provider(provider)
+        global _tracer
+        _tracer = ot_trace.get_tracer("rag.app")
+    except Exception:
+        # best-effort init
+        pass
+
+def _trace_event(name: str, attrs: dict | None = None) -> None:
+    try:
+        span = ot_trace.get_current_span()
+        if span:
+            span.add_event(name, attributes=attrs or {})
+    except Exception:
+        pass
+
+def _trace_sampled() -> bool:
+    # Allow dynamic sampling via Redis key trace:sampler_rate (0.0..1.0)
+    rate = 0.1
+    if _redis_usable():
+        try:
+            v = _redis.get("trace:sampler_rate")
+            if v is not None:
+                rate = max(0.0, min(1.0, float(v)))
+        except Exception:
+            _record_redis_failure()
+    try:
+        return random.random() < rate
+    except Exception:
+        return False
+
 # ---- Phase 11: Policy admin endpoints ----
 @app.post("/admin/policy/set", tags=["Admin"])
 def admin_policy_set(request: Request, tenant: str, body: dict):
@@ -1132,7 +1171,7 @@ def _startup():
 def ask(req: AskReq, request: Request):
     global _cb_failures, _cb_open_until
     span_ctx = None
-    if _tracer is not None:
+    if _tracer is not None and _trace_sampled():
         span_ctx = _tracer.start_as_current_span("ask")
         span_ctx.__enter__()
     # Authorization (optional, enabled when API_KEY is set)
@@ -1298,6 +1337,7 @@ def ask(req: AskReq, request: Request):
                     CACHE_HITS_TOTAL.labels(tenant=tenant_label).inc()
                 except Exception:
                     pass
+                _trace_event("cache.hit", {"kind": "coarse", "tenant": tenant_label})
                 obj = json.loads(v)
                 return obj
         except Exception:
@@ -1343,6 +1383,7 @@ def ask(req: AskReq, request: Request):
                 cached = _redis.get(ckey)
                 if cached:
                     CACHE_HITS_TOTAL.labels(tenant=tenant_label).inc()
+                    _trace_event("cache.hit", {"kind": "response", "tenant": tenant_label})
                     return json.loads(cached)
                 else:
                     CACHE_MISSES_TOTAL.labels(tenant=tenant_label).inc()
@@ -1353,6 +1394,7 @@ def ask(req: AskReq, request: Request):
             ent = _cache.get(ckey)
             if ent and (time.time() - ent["t"]) < Config.CACHE_TTL_SECONDS:
                 CACHE_HITS_TOTAL.labels(tenant=tenant_label).inc()
+                _trace_event("cache.hit", {"kind": "response_mem", "tenant": tenant_label})
                 return ent["v"]
             else:
                 CACHE_MISSES_TOTAL.labels(tenant=tenant_label).inc()
@@ -1372,6 +1414,7 @@ def ask(req: AskReq, request: Request):
                 cached = _redis.get(skey)
                 if cached:
                     SEM_CACHE_HITS_TOTAL.labels(tenant=tenant_label).inc()
+                    _trace_event("cache.hit", {"kind": "semantic", "tenant": tenant_label})
                     return json.loads(cached)
                 else:
                     SEM_CACHE_MISSES_TOTAL.labels(tenant=tenant_label).inc()
@@ -1382,6 +1425,7 @@ def ask(req: AskReq, request: Request):
             ent = _sem_cache.get(skey)
             if ent and (time.time() - ent["t"]) < Config.SEMANTIC_CACHE_TTL_SECONDS:
                 SEM_CACHE_HITS_TOTAL.labels(tenant=tenant_label).inc()
+                _trace_event("cache.hit", {"kind": "semantic_mem", "tenant": tenant_label})
                 return ent["v"]
             else:
                 SEM_CACHE_MISSES_TOTAL.labels(tenant=tenant_label).inc()
@@ -1615,6 +1659,7 @@ def ask(req: AskReq, request: Request):
         action = _budget_check_and_record(tenant_label, approx_tokens, limits.get("daily_usd_cap", 50.0))
         if action != "allow":
             TENANT_BUDGET_ENFORCED_TOTAL.labels(tenant=tenant_label, action=action).inc()
+            _trace_event("budget.action", {"tenant": tenant_label, "action": action, "tokens": approx_tokens})
             if action == "reject":
                 raise HTTPException(status_code=402, detail="Budget exceeded for tenant")
     except HTTPException:
@@ -1826,7 +1871,14 @@ def ask(req: AskReq, request: Request):
             _budget_add_spend(tenant_label, float(cost))
     except Exception:
         pass
-    return resp
+    try:
+        return resp
+    finally:
+        if span_ctx is not None:
+            try:
+                span_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
 
 @app.post(
     "/feedback",

@@ -1,0 +1,85 @@
+{
+  "title": "Quality SLO",
+  "uid": "quality-slo",
+  "schemaVersion": 37,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Offline Recall@k (last)",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "targets": [
+        { "expr": "offline_eval_recall_last" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Offline Answer Contains (last)",
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+      "targets": [
+        { "expr": "offline_eval_answer_contains_last" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "HITL Confidence",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "histogram_quantile(0.5, sum(rate(hitl_confidence_bucket[5m])) by (le))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.9, sum(rate(hitl_confidence_bucket[5m])) by (le))", "legendFormat": "p90" }
+      ]
+    },
+    {
+      "type": "bargauge",
+      "title": "HITL Enqueued Rate by Tenant",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "sum(rate(hitl_enqueued_total[5m])) by (tenant)", "legendFormat": "{{tenant}}" }
+      ]
+    },
+    {
+      "type": "bargauge",
+      "title": "Budget Enforcements by Tenant (rate)",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "sum(rate(tenant_budget_enforced_total[5m])) by (tenant,action)", "legendFormat": "{{tenant}}/{{action}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "LLM Latency p50/p90",
+      "gridPos": { "x": 0, "y": 12, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "histogram_quantile(0.5, sum(rate(ask_llm_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.9, sum(rate(ask_llm_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p90" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Request Latency p50/p90",
+      "gridPos": { "x": 12, "y": 16, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "histogram_quantile(0.5, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, path))", "legendFormat": "p50 {{path}}" },
+        { "expr": "histogram_quantile(0.9, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, path))", "legendFormat": "p90 {{path}}" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Cache Hit Ratio (response)",
+      "gridPos": { "x": 0, "y": 20, "w": 6, "h": 4 },
+      "targets": [
+        { "expr": "sum(rate(cache_hits_total[5m])) / clamp_min(sum(rate(cache_hits_total[5m]))+sum(rate(cache_misses_total[5m])), 1)" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Semantic Cache Hit Ratio",
+      "gridPos": { "x": 6, "y": 20, "w": 6, "h": 4 },
+      "targets": [
+        { "expr": "sum(rate(semantic_cache_hits_total[5m])) / clamp_min(sum(rate(semantic_cache_hits_total[5m]))+sum(rate(semantic_cache_misses_total[5m])), 1)" }
+      ]
+    }
+  ]
+}
