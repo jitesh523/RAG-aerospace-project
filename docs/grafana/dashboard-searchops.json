@@ -1,0 +1,43 @@
+{
+  "title": "SearchOps",
+  "uid": "searchops",
+  "schemaVersion": 37,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-24h", "to": "now" },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Active Index",
+      "gridPos": { "x": 0, "y": 0, "w": 8, "h": 4 },
+      "targets": [
+        { "expr": "label_replace(ignoring(job) (vector(1)), \"active\", \"$active\", \"dummy\", \"dummy\")", "refId": "A" }
+      ],
+      "options": { "reduceOptions": { "calcs": ["last"] } }
+    },
+    {
+      "type": "bargauge",
+      "title": "Source Freshness Lag (s)",
+      "gridPos": { "x": 8, "y": 0, "w": 16, "h": 8 },
+      "targets": [
+        { "expr": "max by (source) (source_freshness_lag_seconds)", "legendFormat": "{{source}}" }
+      ]
+    },
+    {
+      "type": "bargauge",
+      "title": "Canary Builds (rate)",
+      "gridPos": { "x": 0, "y": 4, "w": 8, "h": 8 },
+      "targets": [
+        { "expr": "sum(rate(index_builds_total[5m])) by (status)", "legendFormat": "{{status}}" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Promotions (5m)",
+      "gridPos": { "x": 8, "y": 8, "w": 8, "h": 4 },
+      "targets": [
+        { "expr": "sum(rate(index_promotions_total[5m]))" }
+      ]
+    }
+  ]
+}

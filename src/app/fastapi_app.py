@@ -162,7 +162,7 @@ from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
 
 from src.app.deps import build_chain
 from src.config import Config
-from src.index.milvus_index import check_milvus_readiness
+from src.index.milvus_index import check_milvus_readiness, begin_canary_build, promote_canary, index_status
 from src.eval.offline_eval import run_offline_eval
 from src.eval.feedback_export import export_feedback
 from src.eval.online_eval import run_shadow_eval
@@ -246,6 +246,75 @@ def admin_policy_test(request: Request, tenant: str, body: dict):
     filt, decision = policy_eval_pre(body or {}, pol)
     ans, srcs, post_dec = policy_eval_post(body.get("answer", ""), body.get("sources", []) or [], pol, override=bool(body.get("override", False)))
     return {"ok": True, "pre": {"filters": filt, "decision": decision}, "post": {"answer": ans, "sources": srcs, "decision": post_dec}}
+
+# ---- Phase 17: Data Lifecycle & SearchOps ----
+def _freshness_touch(source: str, ts: int | None = None):
+    if not source:
+        return
+    if _redis_usable():
+        try:
+            now = ts or int(time.time())
+            _redis.hset("sources:last_ts", mapping={source: str(now)})
+            _redis.sadd("sources:known", source)
+        except Exception:
+            _record_redis_failure()
+
+def _freshness_update_metrics():
+    if not _redis_usable():
+        return
+    try:
+        now = int(time.time())
+        known = _redis.smembers("sources:known") or []
+        last = _redis.hgetall("sources:last_ts") or {}
+        for s in known:
+            try:
+                ts = int(last.get(s, "0"))
+            except Exception:
+                ts = 0
+            lag = max(0, now - ts) if ts else 0
+            try:
+                SOURCE_FRESHNESS_LAG_SECONDS.labels(source=s).set(lag)
+            except Exception:
+                pass
+    except Exception:
+        _record_redis_failure()
+
+@app.post("/admin/index/canary/build", tags=["Admin"])
+def admin_index_canary_build(request: Request):
+    require_admin(request)
+    try:
+        st = begin_canary_build()
+        INDEX_BUILDS_TOTAL.labels(status="started").inc()
+        return {"ok": True, "status": st}
+    except Exception as e:
+        INDEX_BUILDS_TOTAL.labels(status="error").inc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/admin/index/canary/promote", tags=["Admin"])
+def admin_index_canary_promote(request: Request):
+    require_admin(request)
+    try:
+        st = promote_canary()
+        INDEX_PROMOTIONS_TOTAL.inc()
+        return {"ok": True, "status": st}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/admin/index/status", tags=["Admin"])
+def admin_index_status(request: Request):
+    require_admin(request)
+    try:
+        st = index_status()
+        return {"ok": True, "status": st}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/admin/source/freshness", tags=["Admin"])
+def admin_source_freshness(request: Request, source: str, ts: int | None = None):
+    require_admin(request)
+    _freshness_touch(source, ts)
+    _freshness_update_metrics()
+    return {"ok": True}
 
 # ---- Phase 14: Cache and Cost admin endpoints ----
 def _cache_cfg() -> dict:
@@ -779,6 +848,20 @@ OFFLINE_EVAL_ANS_SCORE_LAST = Gauge(
 DR_REPLICATION_LAG_SECONDS = Gauge(
     "dr_replication_lag_seconds",
     "Replication lag between primary and secondary (s)",
+)
+INDEX_BUILDS_TOTAL = Counter(
+    "index_builds_total",
+    "Index canary builds triggered",
+    labelnames=["status"],
+)
+INDEX_PROMOTIONS_TOTAL = Counter(
+    "index_promotions_total",
+    "Index promotions from canary to active",
+)
+SOURCE_FRESHNESS_LAG_SECONDS = Gauge(
+    "source_freshness_lag_seconds",
+    "Source data freshness lag in seconds",
+    labelnames=["source"],
 )
 HITL_ENQUEUED_TOTAL = Counter(
     "hitl_enqueued_total",

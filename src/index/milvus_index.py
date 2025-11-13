@@ -1,7 +1,7 @@
 from pymilvus import (
     connections, FieldSchema, CollectionSchema, DataType, Collection, utility
 )
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from src.config import Config
 from prometheus_client import Counter
 import time
@@ -126,6 +126,90 @@ def check_milvus_readiness(name: str = Config.MILVUS_COLLECTION) -> dict:
         # Keep defaults; caller can inspect
         pass
     return info
+
+# ---- Phase 17: Canary index helpers ----
+def _rc() -> Optional['_r.Redis']:
+    if _r is None or not Config.REDIS_URL:
+        return None
+    try:
+        return _r.Redis.from_url(Config.REDIS_URL, decode_responses=True)
+    except Exception:
+        return None
+
+def get_active_collection_name() -> str:
+    r = _rc()
+    if r is None:
+        return Config.MILVUS_COLLECTION
+    try:
+        v = r.get("index:active")
+        return v or Config.MILVUS_COLLECTION
+    except Exception:
+        return Config.MILVUS_COLLECTION
+
+def get_canary_collection_name() -> str:
+    r = _rc()
+    base = get_active_collection_name()
+    if r is None:
+        return f"{base}_canary"
+    try:
+        v = r.get("index:canary")
+        return v or f"{base}_canary"
+    except Exception:
+        return f"{base}_canary"
+
+def begin_canary_build() -> dict:
+    """Create canary collection (if missing) and mark build start time.
+    Returns status dict with names and timestamps.
+    """
+    canary = get_canary_collection_name()
+    ensure_collection(canary)
+    r = _rc()
+    now = int(time.time())
+    if r is not None:
+        try:
+            r.set("index:canary_build_started", str(now))
+            r.set("index:canary", canary)
+        except Exception:
+            pass
+    return {"active": get_active_collection_name(), "canary": canary, "started": now}
+
+def promote_canary() -> dict:
+    """Promote canary collection by switching the active pointer.
+    Does not delete old active collection.
+    """
+    r = _rc()
+    active = get_active_collection_name()
+    canary = get_canary_collection_name()
+    now = int(time.time())
+    if r is not None:
+        try:
+            r.set("index:active", canary)
+            r.set("index:last_promotion_ts", str(now))
+            r.set("index:previous_active", active)
+        except Exception:
+            pass
+    return {"active": canary, "previous_active": active, "promoted_at": now}
+
+def index_status() -> dict:
+    r = _rc()
+    st = {
+        "active": get_active_collection_name(),
+        "canary": get_canary_collection_name(),
+        "build_started": None,
+        "last_promotion_ts": None,
+    }
+    if r is not None:
+        try:
+            bs = r.get("index:canary_build_started")
+            lp = r.get("index:last_promotion_ts")
+            st["build_started"] = int(bs) if bs else None
+            st["last_promotion_ts"] = int(lp) if lp else None
+        except Exception:
+            pass
+    # Include readiness of both
+    st["active_ready"] = check_milvus_readiness(st["active"]).get("loaded", False)
+    st["canary_ready"] = check_milvus_readiness(st["canary"]).get("loaded", False)
+    return st
 
 def check_milvus_readiness_secondary(name: str = Config.MILVUS_COLLECTION_SECONDARY) -> dict:
     info = {"connected": False, "has_collection": False, "loaded": False}
