@@ -183,7 +183,7 @@ def _faiss_filter_callable_from_filters(filters):
             return False
     return _pred
 
-def build_chain(filters=None, llm_model: str | None = None, rerank_enabled: bool | None = None, k_override: int | None = None, fetch_k_override: int | None = None):
+def build_chain(filters=None, llm_model: str | None = None, rerank_enabled: bool | None = None, k_override: int | None = None, fetch_k_override: int | None = None, milvus_collection_override: str | None = None):
     if Config.MOCK_MODE:
         class _FakeChain:
             def invoke(self, q):
@@ -201,7 +201,7 @@ def build_chain(filters=None, llm_model: str | None = None, rerank_enabled: bool
             # Determine read-preferred region
             host = Config.MILVUS_HOST
             port = str(Config.MILVUS_PORT)
-            cname = Config.MILVUS_COLLECTION
+            cname = milvus_collection_override or Config.MILVUS_COLLECTION
             if Config.DR_ENABLED and Config.MILVUS_HOST_SECONDARY:
                 pref = (Config.DR_READ_PREFERRED or "primary").lower()
                 try:
@@ -215,7 +215,7 @@ def build_chain(filters=None, llm_model: str | None = None, rerank_enabled: bool
                 if pref == "secondary":
                     host = Config.MILVUS_HOST_SECONDARY
                     port = str(Config.MILVUS_PORT_SECONDARY)
-                    cname = Config.MILVUS_COLLECTION_SECONDARY
+                    cname = milvus_collection_override or Config.MILVUS_COLLECTION_SECONDARY
             vs = LC_Milvus(
                 embedding_function=embeddings,
                 collection_name=cname,

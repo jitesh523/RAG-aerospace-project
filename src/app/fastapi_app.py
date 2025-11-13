@@ -291,9 +291,21 @@ def admin_index_canary_build(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/admin/index/canary/promote", tags=["Admin"])
-def admin_index_canary_promote(request: Request):
+def admin_index_canary_promote(request: Request, force: bool = False):
     require_admin(request)
     try:
+        # If not forced, require last evaluation pass
+        if not force and _redis_usable():
+            try:
+                ev = _redis.get("index:last_canary_eval")
+                if ev:
+                    data = json.loads(ev)
+                    if not bool(data.get("pass", False)):
+                        raise HTTPException(status_code=412, detail="Canary gate not passed; use force=true to override")
+            except HTTPException:
+                raise
+            except Exception:
+                _record_redis_failure()
         st = promote_canary()
         INDEX_PROMOTIONS_TOTAL.inc()
         return {"ok": True, "status": st}
@@ -315,6 +327,161 @@ def admin_source_freshness(request: Request, source: str, ts: int | None = None)
     _freshness_touch(source, ts)
     _freshness_update_metrics()
     return {"ok": True}
+
+def _index_gate_cfg() -> dict:
+    cfg = {"max_latency_increase_pct": 20.0, "min_source_overlap": 0.8, "sample_count": 50}
+    if _redis_usable():
+        try:
+            h = _redis.hgetall("index:gate") or {}
+            if "max_latency_increase_pct" in h:
+                cfg["max_latency_increase_pct"] = float(h.get("max_latency_increase_pct"))
+            if "min_source_overlap" in h:
+                cfg["min_source_overlap"] = float(h.get("min_source_overlap"))
+            if "sample_count" in h:
+                cfg["sample_count"] = int(h.get("sample_count"))
+        except Exception:
+            _record_redis_failure()
+    return cfg
+
+def _load_golden_queries(limit: int) -> list[str]:
+    qs = []
+    try:
+        path = Config.EVAL_GOLDEN_PATH
+        with open(path, "r") as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                    q = (obj.get("query") or obj.get("question") or "").strip()
+                    if q:
+                        qs.append(q)
+                        if len(qs) >= limit:
+                            break
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return qs
+
+def _measure_index(queries: list[str], collection_name: str) -> dict:
+    latencies = []
+    per_q_sources = []
+    for q in queries:
+        try:
+            ch = build_chain(milvus_collection_override=collection_name)
+            t0 = time.time()
+            res = ch.invoke(q)
+            latencies.append(time.time() - t0)
+            docs = res.get("source_documents", [])
+            srcs = set()
+            for d in docs:
+                try:
+                    md = getattr(d, "metadata", {})
+                    s = md.get("source", "")
+                    if s:
+                        srcs.add(s)
+                except Exception:
+                    continue
+            per_q_sources.append(srcs)
+        except Exception:
+            latencies.append(9e9)
+            per_q_sources.append(set())
+    lat_sorted = sorted([x for x in latencies if x < 1e9])
+    def pctl(p):
+        if not lat_sorted:
+            return None
+        k = max(0, min(len(lat_sorted)-1, int(round(p * (len(lat_sorted)-1)))))
+        return lat_sorted[k]
+    return {"p50": pctl(0.5), "p95": pctl(0.95), "sources": per_q_sources}
+
+@app.post("/admin/index/canary/evaluate", tags=["Admin"])
+def admin_index_canary_evaluate(request: Request, sample_count: int | None = None):
+    require_admin(request)
+    cfg = _index_gate_cfg()
+    n = int(sample_count or cfg.get("sample_count", 50))
+    queries = _load_golden_queries(n)
+    if not queries:
+        raise HTTPException(status_code=400, detail="No golden queries available for evaluation")
+    try:
+        # Measure active
+        from src.index.milvus_index import get_active_collection_name, get_canary_collection_name
+        active = get_active_collection_name()
+        canary = get_canary_collection_name()
+        m_active = _measure_index(queries, active)
+        m_canary = _measure_index(queries, canary)
+        if not (m_active.get("p95") and m_canary.get("p95")):
+            raise HTTPException(status_code=500, detail="Unable to compute latency percentiles")
+        inc_pct = ((m_canary["p95"] - m_active["p95"]) / max(1e-6, m_active["p95"])) * 100.0
+        # Compute average per-query source overlap Jaccard
+        overlaps = []
+        for i in range(min(len(m_active["sources"]), len(m_canary["sources"]))):
+            a = m_active["sources"][i]
+            b = m_canary["sources"][i]
+            inter = len(a & b)
+            uni = len(a | b) or 1
+            overlaps.append(inter / uni)
+        avg_overlap = sum(overlaps)/len(overlaps) if overlaps else 0.0
+        gate_ok = (inc_pct <= float(cfg.get("max_latency_increase_pct", 20.0))) and (avg_overlap >= float(cfg.get("min_source_overlap", 0.8)))
+        out = {"active": active, "canary": canary, "p95_active": m_active["p95"], "p95_canary": m_canary["p95"], "latency_increase_pct": inc_pct, "avg_source_overlap": avg_overlap, "pass": gate_ok}
+        if _redis_usable():
+            try:
+                _redis.set("index:last_canary_eval", json.dumps(out))
+            except Exception:
+                _record_redis_failure()
+        return {"ok": True, "result": out}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ---- Tenant batch endpoints ----
+@app.get("/admin/tenant/list", tags=["Admin"])
+def admin_tenant_list(request: Request):
+    require_admin(request)
+    tenants = []
+    if _redis_usable():
+        try:
+            # scan keys tier:* for tenant list
+            # simple approach: assume small cardinality and use KEYS
+            keys = _redis.keys("tier:*")
+            for k in keys:
+                if k.startswith("tier:") and ":limits:" not in k:
+                    tenants.append(k.split(":",1)[1])
+        except Exception:
+            _record_redis_failure()
+    return {"ok": True, "tenants": sorted(set(tenants))}
+
+@app.post("/admin/tenant/batch_summary", tags=["Admin"])
+def admin_tenant_batch_summary(request: Request, tenants: list[str]):
+    require_admin(request)
+    out = []
+    for t in tenants or []:
+        try:
+            s = admin_tenant_summary(request, t)
+            out.append(s.get("summary"))
+        except Exception:
+            continue
+    return {"ok": True, "summaries": out}
+
+@app.post("/admin/tenant/export_summaries", tags=["Admin"])
+def admin_tenant_export_summaries(request: Request, tenants: list[str] | None = None):
+    require_admin(request)
+    if not tenants:
+        tl = admin_tenant_list(request)
+        tenants = tl.get("tenants", [])
+    rows = []
+    for t in tenants:
+        try:
+            s = admin_tenant_summary(request, t).get("summary", {})
+            rows.append(s)
+        except Exception:
+            continue
+    content = "\n".join([json.dumps(r) for r in rows])
+    if _redis_usable():
+        try:
+            _redis.set("tenant:last_export", content)
+        except Exception:
+            _record_redis_failure()
+    return PlainTextResponse(content=content, media_type="application/jsonl")
 
 # ---- Phase 18: Router admin endpoints ----
 def _router_policy(tenant: str) -> dict:
