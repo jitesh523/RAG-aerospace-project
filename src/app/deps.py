@@ -183,7 +183,7 @@ def _faiss_filter_callable_from_filters(filters):
             return False
     return _pred
 
-def build_chain(filters=None, llm_model: str | None = None, rerank_enabled: bool | None = None):
+def build_chain(filters=None, llm_model: str | None = None, rerank_enabled: bool | None = None, k_override: int | None = None, fetch_k_override: int | None = None):
     if Config.MOCK_MODE:
         class _FakeChain:
             def invoke(self, q):
@@ -230,8 +230,10 @@ def build_chain(filters=None, llm_model: str | None = None, rerank_enabled: bool
         # Default to FAISS
         vs = FAISS.load_local("./faiss_store", embeddings=embeddings)
 
-    # search kwargs based on filters and backend
-    search_kwargs = {"k": Config.RETRIEVER_K, "fetch_k": Config.RETRIEVER_FETCH_K}
+    # search kwargs based on filters and backend (allow overrides)
+    k_eff = k_override if k_override is not None else Config.RETRIEVER_K
+    fk_eff = fetch_k_override if fetch_k_override is not None else Config.RETRIEVER_FETCH_K
+    search_kwargs = {"k": k_eff, "fetch_k": fk_eff}
     if backend == "milvus":
         expr = _milvus_expr_from_filters(filters)
         if expr:
@@ -262,7 +264,7 @@ def build_chain(filters=None, llm_model: str | None = None, rerank_enabled: bool
                 delay = max(0.001, Config.RETRY_BASE_DELAY_MS / 1000.0)
                 while attempt < max(1, Config.RETRY_MAX_ATTEMPTS):
                     try:
-                        fetch_k = max(Config.RETRIEVER_FETCH_K, Config.RETRIEVER_K)
+                        fetch_k = max(fk_eff, k_eff)
                         pairs = self._inner.similarity_search_with_score(query, k=fetch_k, **self._search_kwargs)
                         if not pairs:
                             VECTOR_SEARCH_DURATION.labels(self._backend_label).observe(time.time() - start)
@@ -307,7 +309,7 @@ def build_chain(filters=None, llm_model: str | None = None, rerank_enabled: bool
                             k = _key(md)
                             if k in docmap:
                                 out_docs.append(docmap[k])
-                            if len(out_docs) >= Config.RETRIEVER_K:
+                            if len(out_docs) >= k_eff:
                                 break
                         self.last_blend = blended
                         VECTOR_SEARCH_DURATION.labels(self._backend_label).observe(time.time() - start)

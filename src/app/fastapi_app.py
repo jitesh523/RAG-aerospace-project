@@ -1,4 +1,4 @@
-def _has_scope(request: Request, needle: str) -> bool:
+def _has_scope(request: 'Request', needle: str) -> bool:
     try:
         authz = request.headers.get("authorization", "")
         if not authz.lower().startswith("bearer "):
@@ -14,6 +14,121 @@ def _has_scope(request: Request, needle: str) -> bool:
         return (needle in scopes) or (needle in roles)
     except Exception:
         return False
+
+# ---- Phase 15: Tenant tier helpers ----
+def _tenant_tier(tenant: str) -> str:
+    t = tenant or "__default__"
+    if _redis_usable():
+        try:
+            v = _redis.get(f"tier:{t}")
+            if v:
+                return str(v)
+        except Exception:
+            _record_redis_failure()
+    return "pro"
+
+def _tier_limits(tier: str) -> dict:
+    defaults = {
+        "free": {"rate_per_min": 60, "concurrent_max": 2, "k_min": 4, "k_max": 10, "fetch_min": 10, "fetch_max": 20, "daily_usd_cap": 5.0},
+        "pro": {"rate_per_min": 300, "concurrent_max": 8, "k_min": 4, "k_max": 20, "fetch_min": 10, "fetch_max": 50, "daily_usd_cap": 50.0},
+        "enterprise": {"rate_per_min": 1200, "concurrent_max": 32, "k_min": 4, "k_max": 32, "fetch_min": 10, "fetch_max": 80, "daily_usd_cap": 500.0},
+    }
+    base = defaults.get((tier or "pro").lower(), defaults["pro"]).copy()
+    if _redis_usable():
+        try:
+            h = _redis.hgetall(f"tier:limits:{tier}") or {}
+            for k, v in h.items():
+                if k in ["rate_per_min", "concurrent_max", "k_min", "k_max", "fetch_min", "fetch_max"]:
+                    base[k] = int(v)
+                elif k == "daily_usd_cap":
+                    base[k] = float(v)
+        except Exception:
+            _record_redis_failure()
+    return base
+
+def _rl_key(tenant: str) -> str:
+    return f"rate:{tenant}:{int(time.time()//60)}"
+
+def _conc_key(tenant: str) -> str:
+    return f"conc:{tenant}:{int(time.time()//300)}"
+
+def _incr_rate(tenant: str, limit_per_min: int) -> bool:
+    if not _redis_usable():
+        return True
+    try:
+        k = _rl_key(tenant)
+        v = _redis.incr(k)
+        if v == 1:
+            _redis.expire(k, 90)
+        return v <= max(1, int(limit_per_min))
+    except Exception:
+        _record_redis_failure()
+        return True
+
+def _acquire_concurrency(tenant: str, max_conc: int) -> bool:
+    TENANT_INFLIGHT.labels(tenant=tenant).inc()
+    if not _redis_usable():
+        return True
+    try:
+        k = _conc_key(tenant)
+        v = _redis.incr(k)
+        if v == 1:
+            _redis.expire(k, 600)
+        ok = v <= max(1, int(max_conc))
+        if not ok:
+            _redis.decr(k)
+        return ok
+    except Exception:
+        _record_redis_failure()
+        return True
+
+def _release_concurrency(tenant: str) -> None:
+    try:
+        TENANT_INFLIGHT.labels(tenant=tenant).dec()
+    except Exception:
+        pass
+    if not _redis_usable():
+        return
+    try:
+        k = _conc_key(tenant)
+        _redis.decr(k)
+    except Exception:
+        _record_redis_failure()
+
+def _estimate_tokens(texts: list[str]) -> int:
+    # Simple heuristic without external calls
+    total_chars = sum(len(t or "") for t in texts)
+    return max(1, total_chars // 4)
+
+def _tokens_per_dollar() -> float:
+    try:
+        return float(_cost_cfg().get("tokens_per_dollar", 25000))
+    except Exception:
+        return 25000.0
+
+def _budget_key(tenant: str) -> str:
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    return f"budget:{tenant}:{day}"
+
+def _budget_check_and_record(tenant: str, tokens: int, cap_usd: float) -> str:
+    # returns action: "allow"|"downshift"|"reject"
+    if not _redis_usable():
+        return "allow"
+    try:
+        tpd = max(1.0, _tokens_per_dollar())
+        cost_usd = float(tokens) / tpd
+        k = _budget_key(tenant)
+        new = _redis.incrbyfloat(k, cost_usd)
+        if new == cost_usd:
+            _redis.expire(k, 86400)
+        if new > float(cap_usd) * 1.2:
+            return "reject"
+        if new > float(cap_usd):
+            return "downshift"
+        return "allow"
+    except Exception:
+        _record_redis_failure()
+        return "allow"
 import os
 import time
 import uuid
@@ -92,6 +207,100 @@ def admin_policy_test(request: Request, tenant: str, body: dict):
     filt, decision = policy_eval_pre(body or {}, pol)
     ans, srcs, post_dec = policy_eval_post(body.get("answer", ""), body.get("sources", []) or [], pol, override=bool(body.get("override", False)))
     return {"ok": True, "pre": {"filters": filt, "decision": decision}, "post": {"answer": ans, "sources": srcs, "decision": post_dec}}
+
+# ---- Phase 14: Cache and Cost admin endpoints ----
+def _cache_cfg() -> dict:
+    cfg = {
+        "enabled": bool(Config.SEMANTIC_CACHE_ENABLED),
+        "ttl_seconds": int(Config.SEMANTIC_CACHE_TTL_SECONDS),
+    }
+    if _redis_usable():
+        try:
+            h = _redis.hgetall("cache:config") or {}
+            if "ttl_seconds" in h:
+                cfg["ttl_seconds"] = int(h.get("ttl_seconds"))
+            if "enabled" in h:
+                cfg["enabled"] = str(h.get("enabled")).lower() == "true"
+        except Exception:
+            _record_redis_failure()
+    return cfg
+
+@app.get("/admin/cache/config", tags=["Admin"])
+def admin_cache_get(request: Request):
+    require_admin(request)
+    return {"ok": True, "config": _cache_cfg()}
+
+@app.post("/admin/cache/config", tags=["Admin"])
+def admin_cache_set(request: Request, body: dict):
+    require_admin(request)
+    if _redis_usable():
+        try:
+            mapping = {}
+            if "enabled" in body:
+                mapping["enabled"] = str(bool(body.get("enabled"))).lower()
+            if "ttl_seconds" in body:
+                mapping["ttl_seconds"] = str(int(body.get("ttl_seconds")))
+            if mapping:
+                _redis.hset("cache:config", mapping=mapping)
+        except Exception:
+            _record_redis_failure()
+    return {"ok": True, "config": _cache_cfg()}
+
+@app.post("/admin/cache/invalidate", tags=["Admin"])
+def admin_cache_invalidate(request: Request, tenant: str = None):
+    require_admin(request)
+    # bump namespace globally or per-tenant by policy: we support global bump only here
+    try:
+        _bump_cache_ns()
+        try:
+            CACHE_EVICTIONS_TOTAL.inc()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return {"ok": True, "ns": _get_cache_ns()}
+
+def _cost_cfg() -> dict:
+    cfg = {
+        "k_min": 4,
+        "k_max": 20,
+        "fetch_k_min": 10,
+        "fetch_k_max": 50,
+        "downshift_model": Config.LLM_MODEL_CHEAP,
+        "tokens_per_dollar": 25000,
+    }
+    if _redis_usable():
+        try:
+            h = _redis.hgetall("cost:config") or {}
+            for k in list(cfg.keys()):
+                if k in h:
+                    v = h.get(k)
+                    cfg[k] = int(v) if k.endswith("_min") or k.endswith("_max") else v
+            if "tokens_per_dollar" in h:
+                cfg["tokens_per_dollar"] = float(h.get("tokens_per_dollar"))
+        except Exception:
+            _record_redis_failure()
+    return cfg
+
+@app.get("/admin/cost/config", tags=["Admin"])
+def admin_cost_get(request: Request):
+    require_admin(request)
+    return {"ok": True, "config": _cost_cfg()}
+
+@app.post("/admin/cost/config", tags=["Admin"])
+def admin_cost_set(request: Request, body: dict):
+    require_admin(request)
+    if _redis_usable():
+        try:
+            mapping = {}
+            for k in ["k_min","k_max","fetch_k_min","fetch_k_max","downshift_model","tokens_per_dollar"]:
+                if k in (body or {}):
+                    mapping[k] = str(body.get(k))
+            if mapping:
+                _redis.hset("cost:config", mapping=mapping)
+        except Exception:
+            _record_redis_failure()
+    return {"ok": True, "config": _cost_cfg()}
 
 # ---- Phase 13: HITL admin endpoints ----
 @app.get("/admin/hitl/queue", tags=["Admin"])
@@ -364,6 +573,10 @@ CACHE_MISSES_TOTAL = Counter(
     "cache_misses_total",
     "/ask cache misses",
     labelnames=["tenant"],
+)
+CACHE_EVICTIONS_TOTAL = Counter(
+    "cache_evictions_total",
+    "Cache evictions or invalidations",
 )
 DOCS_SOFT_DELETES_TOTAL = Counter(
     "docs_soft_deletes_total",
@@ -685,20 +898,22 @@ _cache_ns_mem = 1
 _cache_neg = {}
 _source_index_mem = {}
 _redis = None
+_redis_cb_failures = 0
+_redis_cb_open_until = 0
 if Config.REDIS_URL:
     try:
         _redis = redis.Redis.from_url(Config.REDIS_URL, decode_responses=True)
         # ping to verify connectivity
         _redis.ping()
-        _redis_cb_failures = 0
     except Exception:
         _redis = None
         # open redis circuit on init failure
         try:
             _redis_cb_failures += 1
-            _redis_cb_open_until = int(time.time()) + max(1, Config.CB_RESET_SECONDS)
-            CIRCUIT_OPEN.labels(component="redis").inc()
-            CIRCUIT_STATE.labels(component="redis").set(1)
+            if _redis_cb_failures >= Config.CB_FAIL_THRESHOLD:
+                _redis_cb_open_until = int(time.time()) + max(1, Config.CB_RESET_SECONDS)
+                CIRCUIT_OPEN.labels(component="redis").inc()
+                CIRCUIT_STATE.labels(component="redis").set(1)
         except Exception:
             pass
     
@@ -972,6 +1187,23 @@ def ask(req: AskReq, request: Request):
         raise HTTPException(status_code=503, detail="Service not ready. Ingest documents to create ./faiss_store and restart.")
     # Determine AB routing for this tenant
     tenant_label = _tenant_from_key(api_key_hdr)
+    # Phase 15: tier enforcement — rate limit and concurrency
+    tier = _tenant_tier(tenant_label)
+    limits = _tier_limits(tier)
+    if not _incr_rate(tenant_label, limits.get("rate_per_min", 300)):
+        try:
+            TENANT_RATE_LIMITED_TOTAL.labels(tenant=tenant_label).inc()
+        except Exception:
+            pass
+        raise HTTPException(status_code=429, detail="Rate limit exceeded for tenant")
+    if not _acquire_concurrency(tenant_label, limits.get("concurrent_max", 8)):
+        try:
+            TENANT_CONCURRENCY_DROPPED_TOTAL.labels(tenant=tenant_label).inc()
+        except Exception:
+            pass
+        raise HTTPException(status_code=429, detail="Too many concurrent requests for tenant")
+    k_bounds = (limits.get("k_min", 4), limits.get("k_max", 20))
+    fk_bounds = (limits.get("fetch_min", 10), limits.get("fetch_max", 50))
     try:
         ASK_USAGE_TOTAL.labels(tenant_label).inc()
     except Exception:
@@ -1041,6 +1273,35 @@ def ask(req: AskReq, request: Request):
     if model_override:
         model_name = model_override
     rerank_enabled = _get_rerank_enabled(tenant_label)
+    # Phase 14: coarse prompt cache read (pre-LLM)
+    coarse_cache_key = None
+    if _redis_usable() and Config.SEMANTIC_CACHE_ENABLED:
+        try:
+            filters_key = {}
+            if req.filters:
+                try:
+                    filters_key = req.filters.dict()
+                except Exception:
+                    filters_key = {}
+            coarse_key_raw = {
+                "ns": _get_cache_ns(),
+                "tenant": tenant_label,
+                "model": model_name,
+                "rerank": bool(rerank_enabled),
+                "q": q,
+                "filters": filters_key,
+            }
+            coarse_cache_key = "ask:coarse:" + hashlib.sha1(json.dumps(coarse_key_raw, sort_keys=True).encode("utf-8")).hexdigest()
+            v = _redis.get(coarse_cache_key)
+            if v:
+                try:
+                    CACHE_HITS_TOTAL.labels(tenant=tenant_label).inc()
+                except Exception:
+                    pass
+                obj = json.loads(v)
+                return obj
+        except Exception:
+            _record_redis_failure()
     # Phase 9: fire-and-forget shadow online eval with sampling
     try:
         if _online_eval_enabled() and random.random() < _online_eval_sample_rate():
@@ -1348,6 +1609,38 @@ def ask(req: AskReq, request: Request):
     except Exception:
         post_answer, post_sources = safe_answer, sources
     resp = {"answer": post_answer, "sources": post_sources}
+    # Phase 15: budget enforcement (record and possibly signal downshift)
+    try:
+        approx_tokens = _estimate_tokens([q, post_answer])
+        action = _budget_check_and_record(tenant_label, approx_tokens, limits.get("daily_usd_cap", 50.0))
+        if action != "allow":
+            TENANT_BUDGET_ENFORCED_TOTAL.labels(tenant=tenant_label, action=action).inc()
+            if action == "reject":
+                raise HTTPException(status_code=402, detail="Budget exceeded for tenant")
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+    # Phase 14: semantic cache write (fine key includes sources simhash)
+    if _redis_usable() and Config.SEMANTIC_CACHE_ENABLED:
+        try:
+            fine_key_raw = {
+                "ns": _get_cache_ns(),
+                "tenant": tenant_label,
+                "model": model_name,
+                "rerank": bool(rerank_enabled),
+                "q": q,
+                "filters": getattr(req.filters, "__dict__", {}) or {},
+                "sources": [s.get("source", "") for s in post_sources],
+            }
+            fine_key = "ask:fine:" + hashlib.sha1(json.dumps(fine_key_raw, sort_keys=True).encode("utf-8")).hexdigest()
+            ttl = max(1, _tenant_ttl(tenant_label))
+            _redis.setex(fine_key, ttl, json.dumps(resp))
+            # also backfill coarse cache if we attempted
+            if coarse_cache_key:
+                _redis.setex(coarse_cache_key, ttl, json.dumps(resp))
+        except Exception:
+            _record_redis_failure()
     # Phase 13: HITL low-confidence routing
     def _compute_confidence() -> float:
         try:
